@@ -3,11 +3,11 @@ Configuration Management
 Centralized settings for the application
 """
 
+import json
 import os
 from typing import List
 
 import boto3
-from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -34,19 +34,26 @@ def _load_ssm_parameters() -> None:
 _load_ssm_parameters()
 
 
+def _fix_list_env_vars():
+    """Pre-process env vars that pydantic-settings expects as JSON arrays.
+    If the value is a plain comma-separated string (not JSON), wrap it as a JSON array.
+    This runs BEFORE Settings() is instantiated so pydantic-settings never sees invalid JSON."""
+    list_fields = [
+        "CORS_ORIGINS", "TRUSTED_PROXY_IPS", "SYSADMIN_ALLOWED_EMAILS",
+        "ALLOWED_FILE_EXTENSIONS", "ALLOWED_MIME_TYPES",
+    ]
+    for key in list_fields:
+        val = os.environ.get(key)
+        if val and not val.strip().startswith("["):
+            items = [item.strip() for item in val.split(",") if item.strip()]
+            os.environ[key] = json.dumps(items)
+
+
+_fix_list_env_vars()
+
+
 class Settings(BaseSettings):
     """Application settings"""
-
-    @field_validator("cors_origins", "trusted_proxy_ips", "sysadmin_allowed_emails", "allowed_file_extensions", "allowed_mime_types", mode="before")
-    @classmethod
-    def parse_comma_separated_list(cls, v):
-        """Accept both JSON arrays and plain comma-separated strings for list fields."""
-        if isinstance(v, str):
-            v = v.strip()
-            if v.startswith("["):
-                return v  # Already JSON — let pydantic parse it
-            return [item.strip() for item in v.split(",") if item.strip()]
-        return v
 
     # Environment
     environment: str = "development"
