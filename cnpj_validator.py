@@ -8,7 +8,7 @@ import io
 import logging
 from typing import Optional, Tuple
 from openai import OpenAI
-from anthropic import Anthropic
+import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 
@@ -45,29 +45,9 @@ def extract_cnpj_from_document(file_path: str, ai_provider: str, api_key: str, m
         Tuple of (recipient_cnpj, sender_cnpj) - both can be None if not found
     """
     try:
-        if ai_provider == "openai":
-            client = OpenAI(api_key=api_key)
+        import base64
 
-            # For images/PDFs, we need to use vision
-            if file_path.lower().endswith(('.pdf', '.jpg', '.jpeg', '.png', '.webp')):
-                import base64
-
-                # OpenAI vision only accepts images — convert PDFs first
-                if file_path.lower().endswith('.pdf'):
-                    file_data = _pdf_to_png_base64(file_path)
-                    media_type = "image/png"
-                else:
-                    with open(file_path, 'rb') as f:
-                        file_data = base64.b64encode(f.read()).decode('utf-8')
-
-                    if file_path.lower().endswith('.png'):
-                        media_type = "image/png"
-                    elif file_path.lower().endswith('.webp'):
-                        media_type = "image/webp"
-                    else:
-                        media_type = "image/jpeg"
-
-                prompt = """Extract ONLY the CNPJ numbers from this document.
+        prompt = """Extract ONLY the CNPJ numbers from this document.
 
 This could be ANY type of Brazilian document:
 - Nota Fiscal / NFe (has recipient and sender CNPJs)
@@ -75,107 +55,92 @@ This could be ANY type of Brazilian document:
 - Recibo, Boleto, or any other commercial document
 
 Look for:
-- NÚMERO DE INSCRIÇÃO or CNPJ field on a Cartão CNPJ → put in "recipient_cnpj"
-- Destinatário/Cliente/Tomador CNPJ (recipient)
+- NUMERO DE INSCRICAO or CNPJ field on a Cartao CNPJ -> put in "recipient_cnpj"
+- Destinatario/Cliente/Tomador CNPJ (recipient)
 - Emitente/Prestador/Remetente CNPJ (sender/issuer)
 
 Return ONLY a JSON object with these exact fields (no markdown, no explanation):
 {
-  "recipient_cnpj": "CNPJ number of recipient/company (números apenas)",
-  "sender_cnpj": "CNPJ number of sender/issuer (números apenas)"
+  "recipient_cnpj": "CNPJ number of recipient/company (numeros apenas)",
+  "sender_cnpj": "CNPJ number of sender/issuer (numeros apenas)"
 }
 
-If this is a Cartão CNPJ with only one CNPJ, put it in "recipient_cnpj".
+If this is a Cartao CNPJ with only one CNPJ, put it in "recipient_cnpj".
 If CNPJ is not found for either field, use null.
-Extract números apenas (only numbers), remove all formatting."""
+Extract numeros apenas (only numbers), remove all formatting."""
 
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:{media_type};base64,{file_data}"
-                                    }
-                                }
-                            ]
-                        }
-                    ],
-                    max_completion_tokens=300,
-                    store=False,
-                )
-
-                result_text = response.choices[0].message.content
-
-        else:  # anthropic
-            client = Anthropic(api_key=api_key)
-
-            # Similar implementation for Anthropic
-            import base64
+        # Prepare image data for vision APIs
+        if file_path.lower().endswith('.pdf'):
+            file_data = _pdf_to_png_base64(file_path)
+            media_type = "image/png"
+        elif file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
             with open(file_path, 'rb') as f:
                 file_data = base64.b64encode(f.read()).decode('utf-8')
-
-            if file_path.lower().endswith('.pdf'):
-                media_type = "application/pdf"
-            elif file_path.lower().endswith('.png'):
+            if file_path.lower().endswith('.png'):
                 media_type = "image/png"
             elif file_path.lower().endswith('.webp'):
                 media_type = "image/webp"
             else:
                 media_type = "image/jpeg"
+        else:
+            logger.warning(f"Unsupported file type for CNPJ extraction: {file_path}")
+            return (None, None)
 
-            prompt = """Extract ONLY the CNPJ numbers from this document.
+        if ai_provider == "gemini":
+            from PIL import Image
+            genai.configure(api_key=api_key)
+            gemini_model = genai.GenerativeModel(model)
 
-This could be ANY type of Brazilian document:
-- Nota Fiscal / NFe (has recipient and sender CNPJs)
-- Cartão CNPJ / Comprovante de Inscrição (has ONE CNPJ - the company's)
-- Recibo, Boleto, or any other commercial document
-
-Look for:
-- NÚMERO DE INSCRIÇÃO or CNPJ field on a Cartão CNPJ → put in "recipient_cnpj"
-- Destinatário/Cliente/Tomador CNPJ (recipient)
-- Emitente/Prestador/Remetente CNPJ (sender/issuer)
-
-Return ONLY a JSON object with these exact fields (no markdown, no explanation):
-{
-  "recipient_cnpj": "CNPJ number of recipient/company (números apenas)",
-  "sender_cnpj": "CNPJ number of sender/issuer (números apenas)"
-}
-
-If this is a Cartão CNPJ with only one CNPJ, put it in "recipient_cnpj".
-If CNPJ is not found for either field, use null.
-Extract números apenas (only numbers), remove all formatting."""
-
-            response = client.messages.create(
-                model=model,
-                max_tokens=300,
-                temperature=0,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": file_data
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt
-                            }
-                        ]
-                    }
-                ]
+            image_bytes = base64.b64decode(file_data)
+            image = Image.open(io.BytesIO(image_bytes))
+            response = gemini_model.generate_content(
+                [prompt, image],
+                generation_config=genai.types.GenerationConfig(max_output_tokens=300, temperature=0.1),
             )
+            result_text = response.text
 
-            result_text = response.content[0].text
+        elif ai_provider == "nova":
+            import boto3 as _boto3
+            import os as _os
+            format_map = {"image/jpeg": "jpeg", "image/png": "png", "image/webp": "webp"}
+            img_format = format_map.get(media_type, "png")
+
+            bedrock = _boto3.client(
+                "bedrock-runtime",
+                region_name=_os.getenv("NOVA_REGION", _os.getenv("AWS_REGION", "us-east-2")),
+            )
+            response = bedrock.converse(
+                modelId=model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"image": {"format": img_format, "source": {"bytes": base64.b64decode(file_data)}}},
+                        {"text": prompt},
+                    ],
+                }],
+                inferenceConfig={"maxTokens": 300, "temperature": 0.1},
+            )
+            result_text = response["output"]["message"]["content"][0]["text"]
+
+        elif ai_provider == "openai":
+            client = OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{file_data}"}},
+                    ],
+                }],
+                max_completion_tokens=300,
+                store=False,
+            )
+            result_text = response.choices[0].message.content
+
+        else:
+            logger.error(f"Unknown AI provider for CNPJ extraction: {ai_provider}")
+            return (None, None)
 
         # Parse JSON response
         import json

@@ -1,6 +1,7 @@
 # AI Integration (for document processing Lambda)
 openai>=1.12.0
-anthropic>=0.18.0
+google-generativeai>=0.8.0
+# boto3 (below) also provides AWS Bedrock for Amazon Nova
 
 # PDF/Image Processing
 PyPDF2>=3.0.0

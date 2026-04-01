@@ -1,0 +1,203 @@
+name: Deploy Dev
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: controlladoria-worker-dev
+
+jobs:
+  deploy:
+    name: Build & Deploy to Dev
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if missing
+        run: |
+          aws ecr describe-repositories --repository-names $ECR_REPOSITORY 2>/dev/null || \
+            aws ecr create-repository --repository-name $ECR_REPOSITORY --image-scanning-configuration scanOnPush=true
+
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Create or update Lambda functions
+        env:
+          IMAGE_URI: ${{ steps.build-image.outputs.image }}
+        run: |
+          # Secrets come from SSM at cold start via AWS_SSM_PREFIX
+          # Only non-secret config is set as env vars here
+          COMMON_ENV='{
+            "Variables": {
+              "AWS_SSM_PREFIX": "/controlladoria/dev/worker/",
+              "AWS_REGION": "us-east-2"
+            }
+          }'
+
+          declare -A FUNCTIONS
+          FUNCTIONS[controlladoria-worker-document-processing-dev]="handlers.process_document.handler|512|600"
+          FUNCTIONS[controlladoria-worker-cleanup-files-dev]="handlers.cleanup_files.handler|256|300"
+          FUNCTIONS[controlladoria-worker-cleanup-tokens-dev]="handlers.cleanup_tokens.handler|256|60"
+          FUNCTIONS[controlladoria-worker-retry-documents-dev]="handlers.retry_documents.handler|256|300"
+
+          for fn in "${!FUNCTIONS[@]}"; do
+            IFS='|' read -r handler memory timeout <<< "${FUNCTIONS[$fn]}"
+
+            EXISTS=$(aws lambda get-function --function-name "$fn" 2>/dev/null && echo "yes" || echo "no")
+
+            if [ "$EXISTS" = "no" ]; then
+              echo "Creating Lambda function $fn..."
+              aws lambda create-function \
+                --function-name "$fn" \
+                --package-type Image \
+                --code ImageUri="$IMAGE_URI" \
+                --role "${{ secrets.LAMBDA_EXECUTION_ROLE_ARN }}" \
+                --memory-size "$memory" \
+                --timeout "$timeout" \
+                --environment "$COMMON_ENV" \
+                --image-config '{"Command": ["'"$handler"'"]}' \
+                --no-cli-pager
+            else
+              echo "Updating Lambda function $fn..."
+              aws lambda update-function-code \
+                --function-name "$fn" \
+                --image-uri "$IMAGE_URI" \
+                --no-cli-pager
+
+              aws lambda wait function-updated --function-name "$fn" --no-cli-pager
+
+              aws lambda update-function-configuration \
+                --function-name "$fn" \
+                --memory-size "$memory" \
+                --timeout "$timeout" \
+                --environment "$COMMON_ENV" \
+                --image-config '{"Command": ["'"$handler"'"]}' \
+                --no-cli-pager
+            fi
+          done
+
+      - name: Wait for Lambda updates
+        run: |
+          for fn in controlladoria-worker-document-processing-dev controlladoria-worker-cleanup-files-dev controlladoria-worker-cleanup-tokens-dev controlladoria-worker-retry-documents-dev; do
+            echo "Waiting for $fn..."
+            aws lambda wait function-updated --function-name "$fn" --no-cli-pager
+          done
+
+      - name: Ensure SQS trigger exists
+        run: |
+          # Document processing trigger (SQS → Lambda)
+          EXISTING=$(aws lambda list-event-source-mappings --function-name controlladoria-worker-document-processing-dev \
+            --query "EventSourceMappings[?contains(EventSourceArn, 'controlladoria-document-processing-dev')]" --output text)
+          if [ -z "$EXISTING" ]; then
+            echo "Creating SQS trigger for document processing..."
+            aws lambda create-event-source-mapping \
+              --function-name controlladoria-worker-document-processing-dev \
+              --event-source-arn "${{ secrets.DEV_SQS_DOCUMENT_PROCESSING_ARN }}" \
+              --batch-size 1 --no-cli-pager
+          fi
+
+      - name: Ensure EventBridge schedules exist
+        run: |
+          # Cleanup files — daily 5 AM UTC (2 AM BRT)
+          RULE_EXISTS=$(aws events describe-rule --name controlladoria-cleanup-files-dev 2>/dev/null && echo "yes" || echo "no")
+          if [ "$RULE_EXISTS" = "no" ]; then
+            echo "Creating EventBridge rule: cleanup-files..."
+            aws events put-rule \
+              --name controlladoria-cleanup-files-dev \
+              --schedule-expression "cron(0 5 * * ? *)" \
+              --state ENABLED
+
+            FN_ARN=$(aws lambda get-function --function-name controlladoria-worker-cleanup-files-dev \
+              --query "Configuration.FunctionArn" --output text)
+
+            aws lambda add-permission \
+              --function-name controlladoria-worker-cleanup-files-dev \
+              --statement-id eventbridge-cleanup-files \
+              --action lambda:InvokeFunction \
+              --principal events.amazonaws.com \
+              --source-arn "arn:aws:events:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):rule/controlladoria-cleanup-files-dev" \
+              2>/dev/null || true
+
+            aws events put-targets \
+              --rule controlladoria-cleanup-files-dev \
+              --targets "Id=cleanup-files,Arn=$FN_ARN"
+          fi
+
+          # Cleanup tokens — every 6 hours
+          RULE_EXISTS=$(aws events describe-rule --name controlladoria-cleanup-tokens-dev 2>/dev/null && echo "yes" || echo "no")
+          if [ "$RULE_EXISTS" = "no" ]; then
+            echo "Creating EventBridge rule: cleanup-tokens..."
+            aws events put-rule \
+              --name controlladoria-cleanup-tokens-dev \
+              --schedule-expression "rate(6 hours)" \
+              --state ENABLED
+
+            FN_ARN=$(aws lambda get-function --function-name controlladoria-worker-cleanup-tokens-dev \
+              --query "Configuration.FunctionArn" --output text)
+
+            aws lambda add-permission \
+              --function-name controlladoria-worker-cleanup-tokens-dev \
+              --statement-id eventbridge-cleanup-tokens \
+              --action lambda:InvokeFunction \
+              --principal events.amazonaws.com \
+              --source-arn "arn:aws:events:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):rule/controlladoria-cleanup-tokens-dev" \
+              2>/dev/null || true
+
+            aws events put-targets \
+              --rule controlladoria-cleanup-tokens-dev \
+              --targets "Id=cleanup-tokens,Arn=$FN_ARN"
+          fi
+
+          # Retry documents — daily 5 AM UTC (2 AM BRT)
+          RULE_EXISTS=$(aws events describe-rule --name controlladoria-retry-documents-dev 2>/dev/null && echo "yes" || echo "no")
+          if [ "$RULE_EXISTS" = "no" ]; then
+            echo "Creating EventBridge rule: retry-documents..."
+            aws events put-rule \
+              --name controlladoria-retry-documents-dev \
+              --schedule-expression "cron(0 5 * * ? *)" \
+              --state ENABLED
+
+            FN_ARN=$(aws lambda get-function --function-name controlladoria-worker-retry-documents-dev \
+              --query "Configuration.FunctionArn" --output text)
+
+            aws lambda add-permission \
+              --function-name controlladoria-worker-retry-documents-dev \
+              --statement-id eventbridge-retry-documents \
+              --action lambda:InvokeFunction \
+              --principal events.amazonaws.com \
+              --source-arn "arn:aws:events:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):rule/controlladoria-retry-documents-dev" \
+              2>/dev/null || true
+
+            aws events put-targets \
+              --rule controlladoria-retry-documents-dev \
+              --targets "Id=retry-documents,Arn=$FN_ARN"
+          fi
+
+      - name: Summary
+        run: echo "Dev deploy complete — image ${{ steps.build-image.outputs.image }}"

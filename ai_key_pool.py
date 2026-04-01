@@ -1,12 +1,16 @@
 """
 AI Key Pool — Round-robin multi-key management with health tracking
 
-Manages multiple API keys per provider (OpenAI / Anthropic) to:
+Manages multiple API keys per provider (Gemini / Nova / OpenAI) to:
 - Distribute load across keys (round-robin)
 - Auto-skip rate-limited keys (exponential backoff)
 - Mark unhealthy keys after consecutive errors
 - Auto-recover keys after cooldown period
-- Provide failover from one provider to another
+- Provide failover across providers: gemini → nova → openai
+
+Note: Amazon Nova uses IAM credentials, not API keys. It's registered
+with a sentinel key ("iam-credentials") so the pool's health tracking
+and failover logic still applies uniformly.
 
 Thread-safe via threading.Lock (processor is a singleton shared across requests).
 """
@@ -26,7 +30,7 @@ class APIKeyState:
     """Tracks health and usage of a single API key"""
 
     key: str
-    provider: str  # "openai" or "anthropic"
+    provider: str  # "gemini", "nova", or "openai"
     model: str
     requests_count: int = 0
     errors_count: int = 0
@@ -55,8 +59,9 @@ class KeyPool:
 
     Usage:
         pool = KeyPool(unhealthy_threshold=3, recovery_seconds=300)
-        pool.register_keys("openai", ["sk-key1", "sk-key2"], "gpt-5-mini")
-        pool.register_keys("anthropic", ["sk-ant-key1"], "claude-haiku-4-5")
+        pool.register_keys("gemini", ["key1", "key2"], "gemini-flash-lite-latest")
+        pool.register_keys("nova", ["iam-credentials"], "us.amazon.nova-lite-v2:0")
+        pool.register_keys("openai", ["sk-key1", "sk-key2"], "gpt-5.4-nano")
 
         key_state = pool.get_next_key("openai")
         if key_state:

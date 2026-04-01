@@ -6,7 +6,31 @@ Centralized settings for the application
 import os
 from typing import List
 
+import boto3
 from pydantic_settings import BaseSettings
+
+
+def _load_ssm_parameters() -> None:
+    """If AWS_SSM_PREFIX is set, fetch all params under that prefix and inject as env vars.
+    In deployed envs (Lambda), SSM becomes the config source.
+    Locally, AWS_SSM_PREFIX is not set, so .env / env vars are used instead."""
+    prefix = os.environ.get("AWS_SSM_PREFIX")
+    if not prefix:
+        return
+
+    region = os.environ.get("AWS_REGION", "us-east-2")
+    ssm = boto3.client("ssm", region_name=region)
+
+    paginator = ssm.get_paginator("get_parameters_by_path")
+    for page in paginator.paginate(Path=prefix, WithDecryption=True):
+        for param in page["Parameters"]:
+            # /controlladoria/dev/worker/DATABASE_URL → DATABASE_URL
+            env_name = param["Name"].removeprefix(prefix)
+            os.environ.setdefault(env_name, param["Value"])
+
+
+# Load SSM before pydantic reads env vars
+_load_ssm_parameters()
 
 
 class Settings(BaseSettings):
@@ -26,22 +50,29 @@ class Settings(BaseSettings):
         "sqlite:///./dresystem.db"  # Use PostgreSQL in production: postgresql://user:pass@host:5432/db
     )
 
-    # AI Provider
-    ai_provider: str = "openai"
-    openai_api_key: str = ""
-    anthropic_api_key: str = ""
+    # AI Provider — comma-separated for multi-provider round-robin: "gemini,nova,openai"
+    # All listed providers are co-primaries. Unlisted providers with keys are implicit failover.
+    ai_provider: str = "gemini"
 
-    # Multi-key AI (comma-separated for round-robin load balancing)
-    # Backward compatible: if empty, falls back to single openai_api_key / anthropic_api_key
-    openai_api_keys: str = ""  # e.g. "sk-key1,sk-key2,sk-key3"
-    anthropic_api_keys: str = ""  # e.g. "sk-ant-key1,sk-ant-key2"
+    # Gemini (Google) — primary
+    gemini_api_key: str = ""
+    gemini_api_keys: str = ""  # Comma-separated for round-robin: "key1,key2,key3"
+    gemini_model: str = "gemini-flash-lite-latest"  # Auto-picks latest Flash Lite
+
+    # Amazon Nova (via AWS Bedrock) — secondary
+    # Uses IAM credentials (aws_access_key_id/aws_secret_access_key below), not API keys
+    nova_model: str = "us.amazon.nova-lite-v2:0"  # Cross-region inference
+    nova_region: str = "us-east-2"  # Bedrock region
+
+    # OpenAI — tertiary fallback
+    openai_api_key: str = ""
+    openai_api_keys: str = ""  # Comma-separated for round-robin: "sk-key1,sk-key2"
+    openai_model: str = "gpt-5.4-nano"  # Cheapest: $0.20/1M input, $1.25/1M output
+
+    # AI Failover & Key Pool
     ai_failover_enabled: bool = True  # Auto-switch provider when all keys for primary fail
     ai_key_unhealthy_threshold: int = 3  # Consecutive errors before marking key unhealthy
     ai_key_recovery_seconds: int = 300  # Seconds before unhealthy key is retried (5 min)
-
-    # AI Model Configuration (cost-optimized for 2026)
-    openai_model: str = "gpt-5-mini"  # Best balance: $0.25/1M input, $2.00/1M output (upgraded from gpt-4o-mini $0.15/$0.60, better than gpt-4o $2.50/$10)
-    anthropic_model: str = "claude-haiku-4-5"  # Latest: $1.00/1M input, $5.00/1M output
 
     # AI Response Caching (requires Redis - disabled by default)
     enable_ai_cache: bool = False  # Enable when Redis is available

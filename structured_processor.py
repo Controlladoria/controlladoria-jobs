@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+import google.generativeai as genai
 from pdf2image import convert_from_path
 from PIL import Image
 
@@ -66,14 +67,21 @@ class StructuredDocumentProcessor:
     """Processes documents and extracts structured financial data"""
 
     def __init__(self):
-        self.ai_provider = AI_PROVIDER
+        # AI_PROVIDER supports comma-separated values: "gemini,nova,openai"
+        # All listed providers are used as co-primaries (round-robin across all).
+        # Unlisted providers with registered keys are still used as failover.
+        raw_provider = AI_PROVIDER or "gemini"
+        self.ai_providers = [p.strip() for p in raw_provider.split(",") if p.strip()]
+        self.ai_provider = self.ai_providers[0]  # backward compat: first is "primary"
         logger.info(
-            f"Initializing StructuredDocumentProcessor with AI provider: {self.ai_provider}"
+            f"Initializing StructuredDocumentProcessor with AI provider(s): {', '.join(self.ai_providers)}"
         )
 
         # Load model configuration (2026 latest models)
-        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-        self.anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
+        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-5.4-nano")
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+        self.nova_model = os.getenv("NOVA_MODEL", "us.amazon.nova-lite-v2:0")
+        self.nova_region = os.getenv("NOVA_REGION", os.getenv("AWS_REGION", "us-east-2"))
 
         # Caching configuration (disabled by default - requires Redis)
         self.enable_cache = os.getenv("ENABLE_AI_CACHE", "False").lower() == "true"
@@ -117,73 +125,86 @@ class StructuredDocumentProcessor:
         if openai_keys:
             self.key_pool.register_keys("openai", openai_keys, self.openai_model)
 
-        # Collect Anthropic keys (multi-key comma-separated, fallback to single key)
-        anthropic_keys_str = os.getenv("ANTHROPIC_API_KEYS", "")
-        anthropic_keys = [k.strip() for k in anthropic_keys_str.split(",") if k.strip()] if anthropic_keys_str else []
-        if not anthropic_keys:
-            single_key = os.getenv("ANTHROPIC_API_KEY", "")
+        # Collect Gemini keys (multi-key comma-separated, fallback to single key)
+        gemini_keys_str = os.getenv("GEMINI_API_KEYS", "")
+        gemini_keys = [k.strip() for k in gemini_keys_str.split(",") if k.strip()] if gemini_keys_str else []
+        if not gemini_keys:
+            single_key = os.getenv("GEMINI_API_KEY", "")
             if single_key:
-                anthropic_keys = [single_key]
-        if anthropic_keys:
-            self.key_pool.register_keys("anthropic", anthropic_keys, self.anthropic_model)
+                gemini_keys = [single_key]
+        if gemini_keys:
+            self.key_pool.register_keys("gemini", gemini_keys, self.gemini_model)
 
-        # Validate: at least the primary provider must have keys
-        if not self.key_pool.has_provider(self.ai_provider):
+        # Register Nova (Amazon Bedrock) if AWS credentials exist
+        if os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_PROFILE"):
+            self.key_pool.register_keys("nova", ["iam-credentials"], self.nova_model)
+
+        # Validate: at least one of the configured providers must have keys
+        configured_with_keys = [p for p in self.ai_providers if self.key_pool.has_provider(p)]
+        if not configured_with_keys:
             raise ValueError(
-                f"No API keys configured for primary AI provider '{self.ai_provider}'. "
-                f"Set OPENAI_API_KEY(S) or ANTHROPIC_API_KEY(S)."
+                f"No API keys configured for any of the AI providers: {self.ai_providers}. "
+                f"Set GEMINI_API_KEY(S), AWS credentials, or OPENAI_API_KEY(S)."
             )
+
+        # Build provider priority list:
+        # 1. Configured providers first (in order specified), then
+        # 2. Any other providers with registered keys as implicit failover
+        self.provider_priority = list(configured_with_keys)
+        for p in ["gemini", "nova", "openai"]:
+            if p not in self.provider_priority and self.key_pool.has_provider(p):
+                self.provider_priority.append(p)
 
         # --- Client cache (key suffix -> SDK client) ---
         # We cache SDK clients to avoid re-creating httpx pools on every call.
         self._clients: dict = {}
         self._thread_local = threading.local()
 
-        # Create initial client for backward compat (self.client still works for non-failover paths)
-        import httpx
-        if self.ai_provider == "openai":
-            import openai
-            first_key = openai_keys[0] if openai_keys else ""
-            self.client = openai.OpenAI(
-                api_key=first_key,
-                timeout=self.timeout,
-                max_retries=0,
-                http_client=httpx.Client(
-                    limits=httpx.Limits(
-                        max_connections=100,
-                        max_keepalive_connections=20,
-                        keepalive_expiry=30.0,
-                    )
-                ),
-            )
-            self._clients[first_key[-6:]] = ("openai", self.client)
-            logger.info(f"✓ OpenAI client initialized (model: {self.openai_model}, keys: {len(openai_keys)})")
-        elif self.ai_provider == "anthropic":
-            import anthropic
-            first_key = anthropic_keys[0] if anthropic_keys else ""
-            self.client = anthropic.Anthropic(
-                api_key=first_key,
-                timeout=self.timeout,
-                max_retries=0,
-                http_client=httpx.Client(
-                    limits=httpx.Limits(
-                        max_connections=100,
-                        max_keepalive_connections=20,
-                        keepalive_expiry=30.0,
-                    )
-                ),
-            )
-            self._clients[first_key[-6:]] = ("anthropic", self.client)
-            logger.info(f"✓ Anthropic client initialized (model: {self.anthropic_model}, keys: {len(anthropic_keys)})")
-        else:
-            raise ValueError(f"Unsupported AI provider: {self.ai_provider}")
+        # Pre-initialize clients for all configured providers (warm start)
+        self.client = None  # backward compat: first provider's client
+        for provider in self.provider_priority:
+            if provider == "openai" and self.key_pool.has_provider("openai"):
+                import httpx
+                import openai
+                first_key = openai_keys[0] if openai_keys else ""
+                client = openai.OpenAI(
+                    api_key=first_key,
+                    timeout=self.timeout,
+                    max_retries=0,
+                    http_client=httpx.Client(
+                        limits=httpx.Limits(
+                            max_connections=100,
+                            max_keepalive_connections=20,
+                            keepalive_expiry=30.0,
+                        )
+                    ),
+                )
+                self._clients[first_key[-6:]] = ("openai", client)
+                if not self.client:
+                    self.client = client
+                logger.info(f"✓ OpenAI client initialized (model: {self.openai_model}, keys: {len(openai_keys)})")
+            elif provider == "gemini" and self.key_pool.has_provider("gemini"):
+                first_key = gemini_keys[0] if gemini_keys else ""
+                genai.configure(api_key=first_key)
+                client = genai.GenerativeModel(self.gemini_model)
+                self._clients[first_key[-6:]] = ("gemini", client)
+                if not self.client:
+                    self.client = client
+                logger.info(f"✓ Gemini client initialized (model: {self.gemini_model}, keys: {len(gemini_keys)})")
+            elif provider == "nova" and self.key_pool.has_provider("nova"):
+                import boto3
+                client = boto3.client("bedrock-runtime", region_name=self.nova_region)
+                self._clients["iam-cr"] = ("nova", client)
+                if not self.client:
+                    self.client = client
+                logger.info(f"✓ Nova/Bedrock client initialized (model: {self.nova_model}, region: {self.nova_region})")
 
-        if self.ai_failover_enabled:
-            secondary = "anthropic" if self.ai_provider == "openai" else "openai"
-            if self.key_pool.has_provider(secondary):
-                logger.info(f"✓ AI failover enabled: {self.ai_provider} -> {secondary}")
-            else:
-                logger.info(f"⚠️  AI failover enabled but no {secondary} keys configured")
+        # Log provider chain
+        if len(self.provider_priority) > 1:
+            logger.info(f"✓ AI provider chain: {' -> '.join(self.provider_priority)}")
+        implicit_failover = [p for p in self.provider_priority if p not in self.ai_providers]
+        if implicit_failover:
+            logger.info(f"  (implicit failover: {', '.join(implicit_failover)})")
 
         # Check for Poppler availability
         self._check_poppler()
@@ -296,29 +317,28 @@ class StructuredDocumentProcessor:
         if cache_key in self._clients:
             return self._clients[cache_key][1]
 
-        import httpx
-        limits = httpx.Limits(
-            max_connections=100,
-            max_keepalive_connections=20,
-            keepalive_expiry=30.0,
-        )
-
         if provider == "openai":
+            import httpx
             import openai
+            limits = httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30.0,
+            )
             client = openai.OpenAI(
                 api_key=api_key,
                 timeout=self.timeout,
                 max_retries=0,
                 http_client=httpx.Client(limits=limits),
             )
+        elif provider == "gemini":
+            genai.configure(api_key=api_key)
+            client = genai.GenerativeModel(self.gemini_model)
+        elif provider == "nova":
+            import boto3
+            client = boto3.client("bedrock-runtime", region_name=self.nova_region)
         else:
-            import anthropic
-            client = anthropic.Anthropic(
-                api_key=api_key,
-                timeout=self.timeout,
-                max_retries=0,
-                http_client=httpx.Client(limits=limits),
-            )
+            raise ValueError(f"Unsupported provider: {provider}")
 
         self._clients[cache_key] = (provider, client)
         return client
@@ -326,21 +346,25 @@ class StructuredDocumentProcessor:
     def _get_extraction_method(self, provider: str, extraction_type: str):
         """Map (provider, extraction_type) to the correct method"""
         method_map = {
+            ("gemini", "image"): self._extract_with_gemini,
+            ("gemini", "pdf"): self._extract_pdf_with_gemini,
+            ("gemini", "excel"): self._extract_excel_with_gemini,
+            ("gemini", "columns"): self._ai_detect_columns_gemini,
+            ("nova", "image"): self._extract_with_nova,
+            ("nova", "pdf"): self._extract_pdf_with_nova,
+            ("nova", "excel"): self._extract_excel_with_nova,
+            ("nova", "columns"): self._ai_detect_columns_nova,
             ("openai", "image"): self._extract_with_openai,
-            ("anthropic", "image"): self._extract_with_anthropic,
             ("openai", "pdf"): self._extract_pdf_with_openai,
-            ("anthropic", "pdf"): self._extract_pdf_with_anthropic_via_image,
             ("openai", "excel"): self._extract_excel_with_openai,
-            ("anthropic", "excel"): self._extract_excel_with_anthropic,
             ("openai", "columns"): self._ai_detect_columns_openai,
-            ("anthropic", "columns"): self._ai_detect_columns_anthropic,
         }
         return method_map.get((provider, extraction_type))
 
     def _is_rate_limit_error(self, error: Exception) -> bool:
         """Check if an exception is a 429 rate-limit error"""
         error_str = str(error)
-        return "429" in error_str or "rate_limit" in error_str.lower()
+        return "429" in error_str or "rate_limit" in error_str.lower() or "ResourceExhausted" in error_str or "ThrottlingException" in error_str
 
     def _is_client_error(self, error: Exception) -> bool:
         """Check if an exception is a 400 client error (bad request format, not a key issue)"""
@@ -361,11 +385,9 @@ class StructuredDocumentProcessor:
         Returns the extraction result (FinancialDocument or dict).
         Raises the last exception if all keys/providers are exhausted.
         """
-        providers_to_try = [self.ai_provider]
-        if self.ai_failover_enabled:
-            secondary = "anthropic" if self.ai_provider == "openai" else "openai"
-            if self.key_pool.has_provider(secondary):
-                providers_to_try.append(secondary)
+        # Use full provider priority list (configured providers + implicit failover)
+        # provider_priority already has configured providers first, then failover
+        providers_to_try = list(self.provider_priority) if self.ai_failover_enabled else list(self.ai_providers)
 
         last_exception = None
 
@@ -752,17 +774,28 @@ class StructuredDocumentProcessor:
                     "error": "Arquivo Excel vazio — nenhuma aba contém dados",
                 }
 
-            # Build combined text for AI (all sheets)
-            excel_text = self._all_sheets_to_text(all_dfs, excel_path.name)
+            # Check total row count to decide chunking strategy
+            total_rows = sum(len(df) for _, df in all_dfs)
+            CHUNK_THRESHOLD = 500  # rows above which we chunk to avoid blowing up AI context
 
             # PRIMARY PATH: Always send to AI for extraction
-            logger.info(f"🤖 Sending Excel to AI ({self.ai_provider}) for extraction...")
+            logger.info(f"🤖 Sending Excel to AI ({self.ai_provider}) for extraction... ({total_rows} total rows)")
             try:
-                structured_data = self._extract_structured_data_from_excel(excel_text)
+                if total_rows <= CHUNK_THRESHOLD:
+                    # Small file — send everything in one shot
+                    excel_text = self._all_sheets_to_text(all_dfs, excel_path.name)
+                    structured_data = self._extract_structured_data_from_excel(excel_text)
+                else:
+                    # Large file — process in chunks and merge results
+                    logger.info(f"📊 Large Excel ({total_rows} rows) — chunking into ~{CHUNK_THRESHOLD}-row batches")
+                    structured_data = self._process_excel_chunked(all_dfs, excel_path.name)
 
                 # Validate AI result has usable data
                 ai_success = False
-                if isinstance(structured_data, FinancialDocument):
+                if isinstance(structured_data, TransactionLedger):
+                    # Chunked processing returns TransactionLedger directly
+                    ai_success = structured_data.total_transactions > 0
+                elif isinstance(structured_data, FinancialDocument):
                     has_txns = structured_data.transactions and len(structured_data.transactions) > 0
                     has_items = structured_data.line_items and len(structured_data.line_items) > 0
                     has_total = structured_data.total_amount and structured_data.total_amount > 0
@@ -906,23 +939,10 @@ class StructuredDocumentProcessor:
         text_parts.append(df.describe(include="all").to_string())
         text_parts.append("\n\n")
 
-        text_parts.append("Dados (Amostra):\n")
+        text_parts.append("Dados:\n")
 
-        # Show more rows for better analysis (increased from 100 to 1000)
-        # For very large files, show first 500, middle 250, and last 250 rows
-        total_rows = len(df)
-        if total_rows <= 1000:
-            # Show all rows if 1000 or less
-            text_parts.append(df.to_string(index=False))
-        else:
-            # For larger datasets, show representative sample
-            text_parts.append("PRIMEIRAS 500 LINHAS:\n")
-            text_parts.append(df.head(500).to_string(index=False))
-            text_parts.append(
-                f"\n\n... (Mostrando amostra de {total_rows} linhas totais) ...\n\n"
-            )
-            text_parts.append("ÚLTIMAS 500 LINHAS:\n")
-            text_parts.append(df.tail(500).to_string(index=False))
+        # Send ALL rows to AI - no sampling, clients need complete extraction
+        text_parts.append(df.to_string(index=False))
 
         return "\n".join(text_parts)
 
@@ -937,22 +957,103 @@ class StructuredDocumentProcessor:
             text_parts.append(f"Linhas: {len(df)}, Colunas: {len(df.columns)}\n")
             text_parts.append(f"Colunas: {', '.join(df.columns.astype(str))}\n\n")
 
-            # For each sheet, show up to 500 rows
-            total_rows = len(df)
-            if total_rows <= 500:
-                text_parts.append(df.to_string(index=False))
-            else:
-                text_parts.append("PRIMEIRAS 300 LINHAS:\n")
-                text_parts.append(df.head(300).to_string(index=False))
-                text_parts.append(
-                    f"\n\n... ({total_rows} linhas totais) ...\n\n"
-                )
-                text_parts.append("ÚLTIMAS 200 LINHAS:\n")
-                text_parts.append(df.tail(200).to_string(index=False))
+            # Send ALL rows - no sampling
+            text_parts.append(df.to_string(index=False))
 
             text_parts.append("\n\n")
 
         return "\n".join(text_parts)
+
+    def _process_excel_chunked(self, all_dfs: list, filename: str):
+        """
+        Process a large Excel file by splitting into chunks, extracting each
+        chunk with AI, and merging the results into a single TransactionLedger.
+
+        This avoids blowing up AI context windows on 1000+ row spreadsheets
+        while still extracting every single row.
+        """
+        import pandas as pd
+        from models import TransactionLedger, Transaction, DateRangeSummary
+
+        CHUNK_SIZE = 500
+        all_transactions = []
+        chunk_index = 0
+
+        for sheet_name, df in all_dfs:
+            total_rows = len(df)
+            if total_rows == 0:
+                continue
+
+            # Split sheet into chunks
+            for start in range(0, total_rows, CHUNK_SIZE):
+                chunk_df = df.iloc[start:start + CHUNK_SIZE]
+                chunk_index += 1
+                end = min(start + CHUNK_SIZE, total_rows)
+                logger.info(
+                    f"  Chunk {chunk_index}: sheet '{sheet_name}' rows {start+1}-{end} of {total_rows}"
+                )
+
+                # Build text for this chunk (include column headers for context)
+                text_parts = [
+                    f"Arquivo Excel: {filename}\n",
+                    f"ABA: {sheet_name} (linhas {start+1} a {end} de {total_rows})\n",
+                    f"Colunas: {', '.join(df.columns.astype(str))}\n\n",
+                    "Dados:\n",
+                    chunk_df.to_string(index=False),
+                ]
+                chunk_text = "\n".join(text_parts)
+
+                try:
+                    result = self._extract_structured_data_from_excel(chunk_text)
+
+                    # Collect transactions from the AI result
+                    if isinstance(result, FinancialDocument) and result.transactions:
+                        all_transactions.extend(result.transactions)
+                    elif hasattr(result, "transactions") and result.transactions:
+                        all_transactions.extend(result.transactions)
+                except Exception as e:
+                    logger.warning(f"  Chunk {chunk_index} AI extraction failed: {e}")
+                    # Continue with remaining chunks — partial extraction is better than none
+
+        if not all_transactions:
+            # All chunks failed — return empty FinancialDocument so caller hits fallback
+            return FinancialDocument(
+                document_type="transaction_ledger",
+                document_number=filename,
+            )
+
+        # Merge all chunk transactions into a single TransactionLedger
+        total_income = sum(
+            t.amount for t in all_transactions
+            if t.transaction_type in ("income", "receita")
+        )
+        total_expense = sum(
+            t.amount for t in all_transactions
+            if t.transaction_type in ("expense", "despesa")
+        )
+
+        dates = [t.date for t in all_transactions if t.date]
+        date_range = DateRangeSummary()
+        if dates:
+            date_range.start_date = min(dates)
+            date_range.end_date = max(dates)
+
+        ledger = TransactionLedger(
+            document_type="transaction_ledger",
+            document_number=filename,
+            total_transactions=len(all_transactions),
+            total_income=total_income,
+            total_expense=total_expense,
+            net_balance=total_income - total_expense,
+            transactions=all_transactions,
+            date_range=date_range,
+        )
+
+        logger.info(
+            f"Chunked extraction complete: {len(all_transactions)} transactions "
+            f"from {chunk_index} chunks (income={total_income}, expense={total_expense})"
+        )
+        return ledger
 
     def _is_transaction_ledger(self, df) -> bool:
         """
@@ -1582,12 +1683,15 @@ class StructuredDocumentProcessor:
         )
 
         for t in transactions:
-            if t.transaction_type == "income":
+            # Normalize Portuguese transaction types to English for aggregation
+            is_income = t.transaction_type in ("income", "receita")
+            if is_income:
                 total_income += t.amount
             else:
                 total_expense += t.amount
 
-            category_totals[t.category][t.transaction_type] += t.amount
+            agg_key = "income" if is_income else "expense"
+            category_totals[t.category][agg_key] += t.amount
             category_totals[t.category]["count"] += 1
 
         # Create category summaries
@@ -1700,13 +1804,27 @@ class StructuredDocumentProcessor:
                         store=False,
                     )
                     raw = response.choices[0].message.content or "{}"
-                else:
-                    response = self._active_client.messages.create(
-                        model=self.anthropic_model,
-                        max_tokens=4000,
-                        messages=[{"role": "user", "content": prompt}],
+                elif self.ai_provider == "gemini":
+                    response = self._active_client.generate_content(
+                        prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            max_output_tokens=4000,
+                            temperature=0.1,
+                        ),
                     )
-                    raw = response.content[0].text if response.content else "{}"
+                    raw = response.text or "{}"
+                elif self.ai_provider == "nova":
+                    response = self._active_client.converse(
+                        modelId=self.nova_model,
+                        messages=[{
+                            "role": "user",
+                            "content": [{"text": prompt}],
+                        }],
+                        inferenceConfig={"maxTokens": 4000, "temperature": 0.1},
+                    )
+                    raw = response["output"]["message"]["content"][0]["text"] if response.get("output") else "{}"
+                else:
+                    raise ValueError(f"Unsupported AI provider: {self.ai_provider}")
 
                 # Strip markdown fences if present
                 raw = raw.strip()
@@ -1799,56 +1917,6 @@ class StructuredDocumentProcessor:
         except Exception as e:
             logger.error(
                 f"❌ OpenAI Excel extraction failed: {type(e).__name__}: {str(e)}"
-            )
-            raise
-
-    def _extract_excel_with_anthropic(self, excel_text: str) -> FinancialDocument:
-        """Extract structured data from Excel using Anthropic Claude with caching and retry"""
-
-        # Check cache
-        cache_key = self._generate_cache_key(excel_text, "anthropic_excel")
-        cached = self._get_cached_response(cache_key)
-        if cached:
-            return FinancialDocument(**cached)
-
-        def _call_anthropic():
-            logger.debug(
-                f"🤖 Calling Anthropic {self.anthropic_model} for Excel extraction..."
-            )
-            response = self._active_client.messages.create(
-                model=self.anthropic_model,
-                max_tokens=3000,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"{self._get_extraction_prompt(self.user_company_info)}\n\nDADOS DO EXCEL:\n{excel_text}",
-                    }
-                ],
-            )
-            return response
-
-        try:
-            response = self._call_with_retry(_call_anthropic)
-
-            json_text = response.content[0].text
-            logger.debug("✓ Anthropic response received, parsing JSON...")
-
-            # Claude might wrap in markdown, clean it up
-            if json_text.startswith("```"):
-                json_text = json_text.split("```")[1]
-                if json_text.startswith("json"):
-                    json_text = json_text[4:]
-
-            json_text = json_text.strip()
-            data = json.loads(json_text)
-
-            # Cache the response
-            self._set_cached_response(cache_key, data)
-
-            return FinancialDocument(**data)
-        except Exception as e:
-            logger.error(
-                f"❌ Anthropic Excel extraction failed: {type(e).__name__}: {str(e)}"
             )
             raise
 
@@ -2125,39 +2193,6 @@ Important rules for Brazilian documents:
             logger.error(f"❌ OpenAI PDF extraction failed: {type(e).__name__}: {str(e)}")
             raise
 
-    def _extract_pdf_with_anthropic_via_image(self, pdf_base64: str) -> FinancialDocument:
-        """
-        Extract structured data from PDF using Anthropic.
-        Anthropic doesn't support native PDF input, so we convert PDF to PNG first.
-        """
-        import io
-        import tempfile
-
-        pdf_bytes = base64.b64decode(pdf_base64)
-
-        # Write to temp file since convert_from_path needs a file path
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(pdf_bytes)
-            tmp_path = tmp.name
-
-        try:
-            pages = convert_from_path(tmp_path, first_page=1, last_page=1, dpi=200)
-            if not pages:
-                raise ValueError("Could not convert PDF to image for Anthropic extraction")
-
-            # Convert first page to PNG base64
-            img_buf = io.BytesIO()
-            pages[0].save(img_buf, format="PNG")
-            img_buf.seek(0)
-            image_base64_png = base64.b64encode(img_buf.read()).decode("utf-8")
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-        return self._extract_with_anthropic(image_base64_png, "png")
-
     def _extract_with_openai(
         self, image_base64: str, image_type: str
     ) -> FinancialDocument:
@@ -2224,68 +2259,281 @@ Important rules for Brazilian documents:
             logger.error(f"❌ OpenAI extraction failed: {type(e).__name__}: {str(e)}")
             raise
 
-    def _extract_with_anthropic(
-        self, image_base64: str, image_type: str
-    ) -> FinancialDocument:
-        """Extract structured data using Anthropic Claude with caching and retry logic"""
+    # ------------------------------------------------------------------
+    # Gemini extraction methods
+    # ------------------------------------------------------------------
 
-        # Check cache first
-        cache_key = self._generate_cache_key(image_base64, "anthropic_image")
+    def _extract_with_gemini(self, image_base64: str, image_type: str) -> FinancialDocument:
+        """Extract financial data from image using Google Gemini"""
+        cache_key = self._generate_cache_key(image_base64, "gemini_image")
         cached = self._get_cached_response(cache_key)
         if cached:
             return FinancialDocument(**cached)
 
-        def _call_anthropic():
-            logger.debug(
-                f"🤖 Calling Anthropic {self.anthropic_model} for extraction..."
-            )
-            response = self._active_client.messages.create(
-                model=self.anthropic_model,
-                max_tokens=3000,  # Anthropic uses max_tokens (NOT max_completion_tokens)
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": f"image/{image_type}",
-                                    "data": image_base64,
-                                },
-                            },
-                            {"type": "text", "text": self._get_extraction_prompt(self.user_company_info)},
-                        ],
-                    }
-                ],
+        def _call_gemini():
+            image_bytes = base64.b64decode(image_base64)
+            image = Image.open(io.BytesIO(image_bytes))
+
+            prompt = self._get_extraction_prompt(self.user_company_info)
+
+            model = self._active_client  # GenerativeModel instance
+            response = model.generate_content(
+                [prompt, image],
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=16000,
+                    temperature=0.1,
+                ),
             )
             return response
 
-        try:
-            # Call with retry logic
-            response = self._call_with_retry(_call_anthropic)
+        response = self._call_with_retry(_call_gemini)
+        json_text = response.text
 
-            json_text = response.content[0].text
-            logger.debug("✓ Anthropic response received, parsing JSON...")
+        # Clean markdown fences if present
+        if json_text.startswith("```"):
+            json_text = json_text.split("```")[1]
+            if json_text.startswith("json"):
+                json_text = json_text[4:]
+        json_text = json_text.strip()
 
-            # Claude might wrap in markdown, clean it up
-            if json_text.startswith("```"):
-                json_text = json_text.split("```")[1]
-                if json_text.startswith("json"):
-                    json_text = json_text[4:]
+        data = json.loads(json_text)
+        self._set_cached_response(cache_key, data)
+        return FinancialDocument(**data)
 
-            json_text = json_text.strip()
-            data = json.loads(json_text)
+    def _extract_pdf_with_gemini(self, pdf_base64: str) -> FinancialDocument:
+        """Extract financial data from PDF using Google Gemini (native PDF support)"""
+        cache_key = self._generate_cache_key(pdf_base64[:200], "gemini_pdf")
+        cached = self._get_cached_response(cache_key)
+        if cached:
+            return FinancialDocument(**cached)
 
-            # Cache the response
-            self._set_cached_response(cache_key, data)
+        def _call_gemini():
+            pdf_bytes = base64.b64decode(pdf_base64)
 
-            return FinancialDocument(**data)
-        except Exception as e:
-            logger.error(
-                f"❌ Anthropic extraction failed: {type(e).__name__}: {str(e)}"
+            prompt = self._get_extraction_prompt(self.user_company_info)
+
+            model = self._active_client
+            response = model.generate_content(
+                [
+                    prompt,
+                    {"mime_type": "application/pdf", "data": pdf_bytes},
+                ],
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=16000,
+                    temperature=0.1,
+                ),
             )
-            raise
+            return response
+
+        response = self._call_with_retry(_call_gemini)
+        json_text = response.text
+
+        if json_text.startswith("```"):
+            json_text = json_text.split("```")[1]
+            if json_text.startswith("json"):
+                json_text = json_text[4:]
+        json_text = json_text.strip()
+
+        data = json.loads(json_text)
+        self._set_cached_response(cache_key, data)
+        return FinancialDocument(**data)
+
+    def _extract_excel_with_gemini(self, excel_text: str) -> FinancialDocument:
+        """Extract financial data from Excel text using Google Gemini"""
+        cache_key = self._generate_cache_key(excel_text[:500], "gemini_excel")
+        cached = self._get_cached_response(cache_key)
+        if cached:
+            return FinancialDocument(**cached)
+
+        def _call_gemini():
+            prompt = f"{self._get_extraction_prompt(self.user_company_info)}\n\nDADOS DO EXCEL:\n{excel_text}"
+
+            model = self._active_client
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=16000,
+                    temperature=0.1,
+                ),
+            )
+            return response
+
+        response = self._call_with_retry(_call_gemini)
+        json_text = response.text
+
+        if json_text.startswith("```"):
+            json_text = json_text.split("```")[1]
+            if json_text.startswith("json"):
+                json_text = json_text[4:]
+        json_text = json_text.strip()
+
+        data = json.loads(json_text)
+        self._set_cached_response(cache_key, data)
+        return FinancialDocument(**data)
+
+    def _ai_detect_columns_gemini(self, df) -> dict:
+        """Use Gemini to detect column structure in tabular data"""
+        prompt = self._build_columns_prompt(df)
+
+        def _call_gemini():
+            model = self._active_client
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=4000,
+                    temperature=0.1,
+                ),
+            )
+            return response
+
+        response = self._call_with_retry(_call_gemini)
+        json_text = response.text
+
+        if json_text.startswith("```"):
+            json_text = json_text.split("```")[1]
+            if json_text.startswith("json"):
+                json_text = json_text[4:]
+
+        return json.loads(json_text.strip())
+
+    # ------------------------------------------------------------------
+    # Nova / Bedrock extraction methods
+    # ------------------------------------------------------------------
+
+    def _extract_with_nova(self, image_base64: str, image_type: str) -> FinancialDocument:
+        """Extract financial data from image using Amazon Nova via Bedrock"""
+        cache_key = self._generate_cache_key(image_base64, "nova_image")
+        cached = self._get_cached_response(cache_key)
+        if cached:
+            return FinancialDocument(**cached)
+
+        # Map common types to Bedrock format
+        format_map = {"jpeg": "jpeg", "jpg": "jpeg", "png": "png", "webp": "webp", "gif": "gif"}
+        img_format = format_map.get(image_type.lower(), "png")
+
+        def _call_nova():
+            prompt = self._get_extraction_prompt(self.user_company_info)
+
+            bedrock = self._active_client  # boto3 bedrock-runtime client
+            response = bedrock.converse(
+                modelId=self.nova_model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "image": {
+                                "format": img_format,
+                                "source": {"bytes": base64.b64decode(image_base64)},
+                            }
+                        },
+                        {"text": prompt},
+                    ],
+                }],
+                inferenceConfig={"maxTokens": 16000, "temperature": 0.1},
+            )
+            return response
+
+        response = self._call_with_retry(_call_nova)
+        json_text = response["output"]["message"]["content"][0]["text"]
+
+        if json_text.startswith("```"):
+            json_text = json_text.split("```")[1]
+            if json_text.startswith("json"):
+                json_text = json_text[4:]
+        json_text = json_text.strip()
+
+        data = json.loads(json_text)
+        self._set_cached_response(cache_key, data)
+        return FinancialDocument(**data)
+
+    def _extract_pdf_with_nova(self, pdf_base64: str) -> FinancialDocument:
+        """Extract financial data from PDF using Amazon Nova.
+        Nova doesn't natively support PDF in Converse API - convert to image first."""
+        # It's base64 - write to temp file first
+        import tempfile
+
+        pdf_bytes = base64.b64decode(pdf_base64)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp.write(pdf_bytes)
+        tmp.close()
+
+        try:
+            poppler_path = os.getenv("POPPLER_PATH") or None
+            images = convert_from_path(tmp.name, first_page=1, last_page=1, dpi=200,
+                                       poppler_path=poppler_path)
+            if not images:
+                raise ValueError("Failed to convert PDF to image for Nova processing")
+
+            img_buffer = io.BytesIO()
+            images[0].save(img_buffer, format="PNG")
+            img_base64 = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+
+            return self._extract_with_nova(img_base64, "png")
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    def _extract_excel_with_nova(self, excel_text: str) -> FinancialDocument:
+        """Extract financial data from Excel text using Amazon Nova via Bedrock"""
+        cache_key = self._generate_cache_key(excel_text[:500], "nova_excel")
+        cached = self._get_cached_response(cache_key)
+        if cached:
+            return FinancialDocument(**cached)
+
+        def _call_nova():
+            prompt = f"{self._get_extraction_prompt(self.user_company_info)}\n\nDADOS DO EXCEL:\n{excel_text}"
+
+            bedrock = self._active_client
+            response = bedrock.converse(
+                modelId=self.nova_model,
+                messages=[{
+                    "role": "user",
+                    "content": [{"text": prompt}],
+                }],
+                inferenceConfig={"maxTokens": 16000, "temperature": 0.1},
+            )
+            return response
+
+        response = self._call_with_retry(_call_nova)
+        json_text = response["output"]["message"]["content"][0]["text"]
+
+        if json_text.startswith("```"):
+            json_text = json_text.split("```")[1]
+            if json_text.startswith("json"):
+                json_text = json_text[4:]
+        json_text = json_text.strip()
+
+        data = json.loads(json_text)
+        self._set_cached_response(cache_key, data)
+        return FinancialDocument(**data)
+
+    def _ai_detect_columns_nova(self, df) -> dict:
+        """Use Amazon Nova to detect column structure in tabular data"""
+        prompt = self._build_columns_prompt(df)
+
+        def _call_nova():
+            bedrock = self._active_client
+            response = bedrock.converse(
+                modelId=self.nova_model,
+                messages=[{
+                    "role": "user",
+                    "content": [{"text": prompt}],
+                }],
+                inferenceConfig={"maxTokens": 4000, "temperature": 0.1},
+            )
+            return response
+
+        response = self._call_with_retry(_call_nova)
+        json_text = response["output"]["message"]["content"][0]["text"]
+
+        if json_text.startswith("```"):
+            json_text = json_text.split("```")[1]
+            if json_text.startswith("json"):
+                json_text = json_text[4:]
+
+        return json.loads(json_text.strip())
 
     def _process_xml(self, xml_path: Path) -> dict:
         """
@@ -2803,25 +3051,6 @@ Use null for any column type you cannot identify."""
             result_text = result_text.split("```")[1].split("```")[0].strip()
         return json.loads(result_text)
 
-    def _ai_detect_columns_anthropic(self, df) -> dict:
-        """AI column detection using Anthropic API format"""
-        prompt = self._build_columns_prompt(df)
-
-        def _call():
-            response = self._active_client.messages.create(
-                model=self.anthropic_model,
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return response.content[0].text.strip()
-
-        result_text = self._call_with_retry(_call)
-        if "```json" in result_text:
-            result_text = result_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in result_text:
-            result_text = result_text.split("```")[1].split("```")[0].strip()
-        return json.loads(result_text)
-
     # ========================================================================
     # V2 File Format Processors (Item 2 - partner feedback)
     # OFX, OFC, DOCX, TXT
@@ -2862,8 +3091,8 @@ Use null for any column type you cannot identify."""
                     ))
 
             # Build ledger
-            total_income = sum(t.amount for t in transactions if t.transaction_type == "income")
-            total_expense = sum(t.amount for t in transactions if t.transaction_type == "expense")
+            total_income = sum(t.amount for t in transactions if t.transaction_type in ("income", "receita"))
+            total_expense = sum(t.amount for t in transactions if t.transaction_type in ("expense", "despesa"))
 
             date_range = DateRangeSummary()
             if dates:
@@ -2977,8 +3206,8 @@ Use null for any column type you cannot identify."""
                     except (ValueError, ArithmeticError):
                         continue
 
-            total_income = sum(t.amount for t in transactions if t.transaction_type == "income")
-            total_expense = sum(t.amount for t in transactions if t.transaction_type == "expense")
+            total_income = sum(t.amount for t in transactions if t.transaction_type in ("income", "receita"))
+            total_expense = sum(t.amount for t in transactions if t.transaction_type in ("expense", "despesa"))
 
             date_range = DateRangeSummary()
             if dates:
