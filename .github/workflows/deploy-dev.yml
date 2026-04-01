@@ -55,8 +55,7 @@ jobs:
           # Only non-secret config is set as env vars here
           COMMON_ENV='{
             "Variables": {
-              "AWS_SSM_PREFIX": "/controlladoria/dev/worker/",
-              "AWS_REGION": "us-east-2"
+              "AWS_SSM_PREFIX": "/controlladoria/dev/worker/"
             }
           }'
 

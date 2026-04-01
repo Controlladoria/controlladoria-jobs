@@ -66,8 +66,7 @@ jobs:
         run: |
           COMMON_ENV='{
             "Variables": {
-              "AWS_SSM_PREFIX": "/controlladoria/prod/worker/",
-              "AWS_REGION": "us-east-2"
+              "AWS_SSM_PREFIX": "/controlladoria/prod/worker/"
             }
           }'
 
