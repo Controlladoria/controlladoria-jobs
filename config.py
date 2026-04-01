@@ -200,7 +200,7 @@ class Settings(BaseSettings):
 
     # Rate Limiting
     rate_limit_enabled: bool = True
-    upload_rate_limit: str = "60/minute"
+    upload_rate_limit: str = "300/minute"
     contact_rate_limit: str = "5/hour"
 
     # Document Retry Settings (nightly retry of failed documents)

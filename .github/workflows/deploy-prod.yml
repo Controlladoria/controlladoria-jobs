@@ -127,7 +127,9 @@ jobs:
             aws lambda create-event-source-mapping \
               --function-name controlladoria-worker-document-processing-prod \
               --event-source-arn "${{ secrets.PROD_SQS_DOCUMENT_PROCESSING_ARN }}" \
-              --batch-size 1 --no-cli-pager
+              --batch-size 1 \
+              --scaling-config '{"MaximumConcurrency": 50}' \
+              --no-cli-pager
           fi
 
       - name: Ensure EventBridge schedules exist

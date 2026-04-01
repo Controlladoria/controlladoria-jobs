@@ -476,9 +476,11 @@ class StructuredDocumentProcessor:
         # Store original filename for context (income/expense detection from filename)
         self._original_filename = Path(file_path).name
 
-        # If using S3, download file to temp location first
+        # If using S3 and the file isn't already local, download it first.
+        # Lambda handlers pre-download from S3 to /tmp, so skip if file exists on disk.
         temp_file = None
-        if settings.use_s3:
+        local_exists = Path(file_path).exists()
+        if settings.use_s3 and not local_exists:
             try:
                 # Download from S3
                 file_content = s3_storage.download_file(file_path)
