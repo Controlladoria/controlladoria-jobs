@@ -61,12 +61,8 @@ def retry_failed_documents():
 
         logger.info(f"Found {len(failed_docs)} failed documents eligible for retry")
 
-        # Check file existence and send SQS messages
-        sqs_kwargs = {"region_name": settings.aws_region}
-        if settings.aws_access_key_id and settings.aws_secret_access_key:
-            sqs_kwargs["aws_access_key_id"] = settings.aws_access_key_id
-            sqs_kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
-        sqs = boto3.client("sqs", **sqs_kwargs)
+        # Let boto3 handle credentials (Lambda execution role / local ~/.aws)
+        sqs = boto3.client("sqs", region_name=settings.aws_region)
         sqs_queue_url = settings.sqs_document_queue_url
 
         retried = 0
@@ -76,11 +72,7 @@ def retry_failed_documents():
             # Check if file still exists in S3
             if doc.file_path:
                 try:
-                    s3_kwargs = {"region_name": settings.aws_region}
-                    if settings.aws_access_key_id and settings.aws_secret_access_key:
-                        s3_kwargs["aws_access_key_id"] = settings.aws_access_key_id
-                        s3_kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
-                    s3 = boto3.client("s3", **s3_kwargs)
+                    s3 = boto3.client("s3", region_name=settings.aws_region)
                     s3.head_object(Bucket=settings.s3_bucket_name, Key=doc.file_path)
                 except Exception:
                     doc.max_retries_exhausted = True

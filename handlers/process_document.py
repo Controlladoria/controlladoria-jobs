@@ -70,28 +70,13 @@ def _download_from_s3(s3_key: str) -> str | None:
     from pathlib import Path
 
     try:
-        # Debug: log who we are and what creds boto3 is using
-        sts = boto3.client("sts")
-        identity = sts.get_caller_identity()
-        logger.info(f"DEBUG Lambda identity: arn={identity['Arn']} account={identity['Account']}")
-
-        # Also check if env vars are leaking credentials
-        import os
-        has_key = bool(os.environ.get("AWS_ACCESS_KEY_ID"))
-        has_secret = bool(os.environ.get("AWS_SECRET_ACCESS_KEY"))
-        has_token = bool(os.environ.get("AWS_SESSION_TOKEN"))
-        logger.info(f"DEBUG env creds: ACCESS_KEY={has_key} SECRET={has_secret} SESSION_TOKEN={has_token}")
-        logger.info(f"DEBUG settings creds: access_key_id='{settings.aws_access_key_id[:4] + '...' if settings.aws_access_key_id else 'EMPTY'}' secret='{'SET' if settings.aws_secret_access_key else 'EMPTY'}'")
-
-        # In Lambda, use the execution role (IAM) — don't pass explicit credentials.
-        s3_kwargs = {"region_name": settings.aws_region}
-        if settings.aws_access_key_id and settings.aws_secret_access_key:
-            # Local dev: use explicit credentials from .env
-            s3_kwargs["aws_access_key_id"] = settings.aws_access_key_id
-            s3_kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
-        s3 = boto3.client("s3", **s3_kwargs)
-
-        logger.info(f"DEBUG s3 client created with explicit_creds={'aws_access_key_id' in s3_kwargs}")
+        # Always let boto3 handle credentials automatically.
+        # In Lambda: uses execution role (STS temp creds with session token).
+        # Locally: uses ~/.aws/credentials or env vars.
+        # NEVER pass settings.aws_access_key_id — pydantic picks up Lambda's
+        # auto-injected AWS_ACCESS_KEY_ID (STS temp creds) but without the
+        # session token, causing 403.
+        s3 = boto3.client("s3", region_name=settings.aws_region)
 
         # Preserve file extension for processor detection
         ext = Path(s3_key).suffix
