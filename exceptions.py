@@ -1,13 +1,13 @@
 """
-Custom exception classes for DreSystem
+Custom exception classes for ControlladorIA
 Provides domain-specific exceptions with structured error responses
 """
 
 from typing import Any, Dict, Optional
 
 
-class DreSystemException(Exception):
-    """Base exception for all DreSystem errors"""
+class ControlladorIAException(Exception):
+    """Base exception for all ControlladorIA errors"""
 
     def __init__(
         self,
@@ -23,7 +23,7 @@ class DreSystemException(Exception):
         super().__init__(self.message)
 
 
-class AuthenticationError(DreSystemException):
+class AuthenticationError(ControlladorIAException):
     """Authentication failed"""
 
     def __init__(
@@ -39,7 +39,7 @@ class AuthenticationError(DreSystemException):
         )
 
 
-class AuthorizationError(DreSystemException):
+class AuthorizationError(ControlladorIAException):
     """Insufficient permissions"""
 
     def __init__(
@@ -55,7 +55,7 @@ class AuthorizationError(DreSystemException):
         )
 
 
-class ResourceNotFoundError(DreSystemException):
+class ResourceNotFoundError(ControlladorIAException):
     """Recurso não encontrado"""
 
     def __init__(
@@ -68,7 +68,7 @@ class ResourceNotFoundError(DreSystemException):
         )
 
 
-class ValidationError(DreSystemException):
+class ValidationError(ControlladorIAException):
     """Data validation failed"""
 
     def __init__(
@@ -81,7 +81,7 @@ class ValidationError(DreSystemException):
         )
 
 
-class PaymentError(DreSystemException):
+class PaymentError(ControlladorIAException):
     """Payment processing error"""
 
     def __init__(
@@ -94,7 +94,7 @@ class PaymentError(DreSystemException):
         )
 
 
-class SubscriptionError(DreSystemException):
+class SubscriptionError(ControlladorIAException):
     """Subscription issue"""
 
     def __init__(
@@ -107,7 +107,7 @@ class SubscriptionError(DreSystemException):
         )
 
 
-class FileProcessingError(DreSystemException):
+class FileProcessingError(ControlladorIAException):
     """File processing error"""
 
     def __init__(
@@ -123,7 +123,7 @@ class FileProcessingError(DreSystemException):
         )
 
 
-class RateLimitError(DreSystemException):
+class RateLimitError(ControlladorIAException):
     """Rate limit exceeded"""
 
     def __init__(
@@ -139,7 +139,7 @@ class RateLimitError(DreSystemException):
         )
 
 
-class DatabaseError(DreSystemException):
+class DatabaseError(ControlladorIAException):
     """Database operation error"""
 
     def __init__(
@@ -150,7 +150,7 @@ class DatabaseError(DreSystemException):
         )
 
 
-class ExternalServiceError(DreSystemException):
+class ExternalServiceError(ControlladorIAException):
     """External service (Stripe, AI, etc.) error"""
 
     def __init__(

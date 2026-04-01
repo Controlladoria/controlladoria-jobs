@@ -9,7 +9,7 @@ from config import settings
 
 # Initialize Celery app
 celery_app = Celery(
-    "dresystem",
+    "controlladoria",
     broker=settings.celery_broker_url or settings.redis_url,
     backend=settings.celery_result_backend or settings.redis_url,
     include=["tasks.document_tasks"],  # Import task modules

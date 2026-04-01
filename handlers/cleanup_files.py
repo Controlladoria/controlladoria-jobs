@@ -2,7 +2,7 @@
 Lambda handler for file cleanup (triggered by EventBridge, daily at 2 AM).
 
 Deletes files older than the retention period and orphaned files.
-Copied from DreSystem/api.py cleanup_old_files().
+Copied from ControlladorIA/api.py cleanup_old_files().
 """
 
 import logging
@@ -31,7 +31,7 @@ def cleanup_old_files():
     - Deletes files older than retention period (default: 12 months)
     - Deletes orphaned files (in S3 but not in database)
 
-    Copied from DreSystem/api.py lines 274-341.
+    Copied from ControlladorIA/api.py lines 274-341.
     """
     from database import SessionLocal, Document
 

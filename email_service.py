@@ -1,6 +1,6 @@
 """
 Email Service with Resend
-Handles transactional emails for DreSystem
+Handles transactional emails for ControlladorIA
 """
 
 import logging
@@ -90,7 +90,7 @@ class EmailService:
         <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Redefinir Senha - DreSystem</title>
+            <title>Redefinir Senha - ControlladorIA</title>
         </head>
         <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f3f4f6;">
             <table role="presentation" style="width: 100%; border-collapse: collapse;">
@@ -100,7 +100,7 @@ class EmailService:
                             <!-- Header -->
                             <tr>
                                 <td style="padding: 40px 40px 20px; text-align: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 8px 8px 0 0;">
-                                    <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: bold;">DreSystem</h1>
+                                    <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: bold;">ControlladorIA</h1>
                                 </td>
                             </tr>
 
@@ -116,7 +116,7 @@ class EmailService:
                                     </p>
 
                                     <p style="margin: 0 0 20px; color: #4b5563; font-size: 16px; line-height: 1.5;">
-                                        Recebemos uma solicitação para redefinir a senha da sua conta no DreSystem.
+                                        Recebemos uma solicitação para redefinir a senha da sua conta no ControlladorIA.
                                     </p>
 
                                     <p style="margin: 0 0 30px; color: #4b5563; font-size: 16px; line-height: 1.5;">
@@ -158,10 +158,10 @@ class EmailService:
                             <tr>
                                 <td style="padding: 30px 40px; background-color: #f9fafb; border-radius: 0 0 8px 8px; text-align: center;">
                                     <p style="margin: 0 0 10px; color: #6b7280; font-size: 14px;">
-                                        DreSystem - Processamento Inteligente de Documentos
+                                        ControlladorIA - Processamento Inteligente de Documentos
                                     </p>
                                     <p style="margin: 0; color: #9ca3af; font-size: 12px;">
-                                        © {current_year} DreSystem. Todos os direitos reservados.
+                                        © {current_year} ControlladorIA. Todos os direitos reservados.
                                     </p>
                                 </td>
                             </tr>
@@ -174,7 +174,7 @@ class EmailService:
         """
 
         return await self.send_email(
-            to=to, subject="Redefinir Senha - DreSystem", html=html
+            to=to, subject="Redefinir Senha - ControlladorIA", html=html
         )
 
     async def send_welcome_email(
@@ -201,7 +201,7 @@ class EmailService:
         <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Bem-vindo ao DreSystem!</title>
+            <title>Bem-vindo ao ControlladorIA!</title>
         </head>
         <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f3f4f6;">
             <table role="presentation" style="width: 100%; border-collapse: collapse;">
@@ -223,7 +223,7 @@ class EmailService:
                                     </h2>
 
                                     <p style="margin: 0 0 20px; color: #4b5563; font-size: 16px; line-height: 1.5;">
-                                        Sua conta foi criada com sucesso! Estamos animados em ter você no DreSystem.
+                                        Sua conta foi criada com sucesso! Estamos animados em ter você no ControlladorIA.
                                     </p>
 
                                     <!-- Trial Box -->
@@ -273,10 +273,10 @@ class EmailService:
                             <tr>
                                 <td style="padding: 30px 40px; background-color: #f9fafb; border-radius: 0 0 8px 8px; text-align: center;">
                                     <p style="margin: 0 0 10px; color: #6b7280; font-size: 14px;">
-                                        DreSystem - Processamento Inteligente de Documentos
+                                        ControlladorIA - Processamento Inteligente de Documentos
                                     </p>
                                     <p style="margin: 0; color: #9ca3af; font-size: 12px;">
-                                        © {current_year} DreSystem. Todos os direitos reservados.
+                                        © {current_year} ControlladorIA. Todos os direitos reservados.
                                     </p>
                                 </td>
                             </tr>
@@ -290,7 +290,7 @@ class EmailService:
 
         return await self.send_email(
             to=to,
-            subject=f"Bem-vindo ao DreSystem! {trial_days} dias grátis 🎉",
+            subject=f"Bem-vindo ao ControlladorIA! {trial_days} dias grátis 🎉",
             html=html,
         )
 
@@ -339,7 +339,7 @@ class EmailService:
                                     </h2>
 
                                     <p style="margin: 0 0 20px; color: #4b5563; font-size: 16px; line-height: 1.5;">
-                                        Obrigado por se cadastrar no DreSystem! Para garantir a segurança da sua conta,
+                                        Obrigado por se cadastrar no ControlladorIA! Para garantir a segurança da sua conta,
                                         precisamos verificar seu endereço de e-mail.
                                     </p>
 
@@ -377,7 +377,7 @@ class EmailService:
                                     <!-- Warning Box -->
                                     <div style="margin: 16px 0 0; padding: 16px; background-color: #fef3c7; border-left: 4px solid #f59e0b; border-radius: 4px;">
                                         <p style="margin: 0; color: #92400e; font-size: 14px;">
-                                            ⚠️ Se você não se cadastrou no DreSystem, ignore este e-mail.
+                                            ⚠️ Se você não se cadastrou no ControlladorIA, ignore este e-mail.
                                         </p>
                                     </div>
                                 </td>
@@ -387,10 +387,10 @@ class EmailService:
                             <tr>
                                 <td style="padding: 30px 40px; background-color: #f9fafb; border-radius: 0 0 8px 8px; text-align: center;">
                                     <p style="margin: 0 0 10px; color: #6b7280; font-size: 14px;">
-                                        DreSystem - Processamento Inteligente de Documentos
+                                        ControlladorIA - Processamento Inteligente de Documentos
                                     </p>
                                     <p style="margin: 0; color: #9ca3af; font-size: 12px;">
-                                        © {current_year} DreSystem. Todos os direitos reservados.
+                                        © {current_year} ControlladorIA. Todos os direitos reservados.
                                     </p>
                                 </td>
                             </tr>
@@ -404,7 +404,7 @@ class EmailService:
 
         return await self.send_email(
             to=to,
-            subject="Verifique seu e-mail - DreSystem",
+            subject="Verifique seu e-mail - ControlladorIA",
             html=html,
         )
 
@@ -508,7 +508,7 @@ class EmailService:
                             <tr>
                                 <td style="padding: 20px 40px; background-color: #f9fafb; border-radius: 0 0 8px 8px; text-align: center;">
                                     <p style="margin: 0; color: #9ca3af; font-size: 12px;">
-                                        Enviado via formulário de contato do DreSystem
+                                        Enviado via formulário de contato do ControlladorIA
                                     </p>
                                 </td>
                             </tr>

@@ -2,7 +2,7 @@
 Lambda handler for expired verification token cleanup
 (triggered by EventBridge, every 6 hours).
 
-Copied from DreSystem/api.py cleanup_expired_verification_tokens().
+Copied from ControlladorIA/api.py cleanup_expired_verification_tokens().
 """
 
 import logging
@@ -27,7 +27,7 @@ def cleanup_expired_verification_tokens():
     Clean up expired email verification tokens.
     Tokens older than 24 hours are cleared from users who haven't verified.
 
-    Copied from DreSystem/api.py lines 345-380.
+    Copied from ControlladorIA/api.py lines 345-380.
     """
     from database import SessionLocal, User
 

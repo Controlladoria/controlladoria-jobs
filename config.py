@@ -66,7 +66,7 @@ class Settings(BaseSettings):
 
     # Database
     database_url: str = (
-        "sqlite:///./dresystem.db"  # Use PostgreSQL in production: postgresql://user:pass@host:5432/db
+        "sqlite:///./controlladoria.db"  # Use PostgreSQL in production: postgresql://user:pass@host:5432/db
     )
 
     # AI Provider — comma-separated for multi-provider round-robin: "gemini,nova,openai"
@@ -229,7 +229,7 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = "INFO"
-    log_file: str = "dresystem.log"
+    log_file: str = "controlladoria.log"
 
     # Localization
     language: str = "pt-BR"

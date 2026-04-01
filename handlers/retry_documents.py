@@ -32,7 +32,7 @@ def retry_failed_documents():
     Find failed documents eligible for retry, reset to PENDING,
     and send SQS messages for reprocessing.
 
-    Simplified from DreSystem/api.py retry_failed_documents().
+    Simplified from ControlladorIA/api.py retry_failed_documents().
     """
     import boto3
     from database import SessionLocal, Document, DocumentStatus

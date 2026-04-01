@@ -5,7 +5,7 @@ Portuguese Brazilian translations for API responses
 
 MESSAGES_PT_BR = {
     # API Info
-    "api_running": "DreSystem API - Sistema de Processamento de Documentos Financeiros",
+    "api_running": "ControlladorIA API - Sistema de Processamento de Documentos Financeiros",
     "api_version": "0.2.0",
     # Upload
     "upload_success": "Documento enviado e processado com sucesso",
@@ -38,7 +38,7 @@ MESSAGES_PT_BR = {
 
 MESSAGES_EN = {
     # API Info
-    "api_running": "DreSystem API - Financial Document Processing System",
+    "api_running": "ControlladorIA API - Financial Document Processing System",
     "api_version": "0.2.0",
     # Upload
     "upload_success": "Document uploaded and processed successfully",

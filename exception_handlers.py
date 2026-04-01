@@ -15,7 +15,7 @@ from pydantic import ValidationError as PydanticValidationError
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.exc import SQLAlchemyError
 
-from exceptions import DreSystemException
+from exceptions import ControlladorIAException
 
 logger = logging.getLogger(__name__)
 
@@ -65,16 +65,16 @@ def create_error_response(
     return error_response
 
 
-async def dresystem_exception_handler(
-    request: Request, exc: DreSystemException
+async def controlladoria_exception_handler(
+    request: Request, exc: ControlladorIAException
 ) -> JSONResponse:
     """
-    Handler for custom DreSystem exceptions
+    Handler for custom ControlladorIA exceptions
 
     Provides consistent formatting for all custom exceptions
     """
     logger.error(
-        f"DreSystemException: {exc.code} - {exc.message}",
+        f"ControlladorIAException: {exc.code} - {exc.message}",
         extra={
             "code": exc.code,
             "status_code": exc.status_code,

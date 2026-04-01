@@ -5,7 +5,7 @@ Receives messages from SQS with document_id and file_path (S3 key),
 downloads the file from S3, processes it with AI extraction,
 and updates the database with results.
 
-This is the same logic that was in DreSystem's routers/documents.py
+This is the same logic that was in ControlladorIA's routers/documents.py
 process_document_background(), now running as a Lambda function.
 """
 
@@ -107,7 +107,7 @@ def _mark_document_failed(document_id: int, error_message: str):
 
 def _process_document(document_id: int, file_path: str):
     """
-    Process a document — extracted from DreSystem's routers/documents.py
+    Process a document — extracted from ControlladorIA's routers/documents.py
     process_document_background(). This is the core AI extraction logic.
     """
     from datetime import datetime
