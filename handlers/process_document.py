@@ -70,12 +70,14 @@ def _download_from_s3(s3_key: str) -> str | None:
     from pathlib import Path
 
     try:
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=settings.aws_access_key_id,
-            aws_secret_access_key=settings.aws_secret_access_key,
-            region_name=settings.aws_region,
-        )
+        # In Lambda, use the execution role (IAM) — don't pass explicit credentials.
+        # Passing empty strings overrides the role and causes 403.
+        s3_kwargs = {"region_name": settings.aws_region}
+        if settings.aws_access_key_id and settings.aws_secret_access_key:
+            # Local dev: use explicit credentials from .env
+            s3_kwargs["aws_access_key_id"] = settings.aws_access_key_id
+            s3_kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
+        s3 = boto3.client("s3", **s3_kwargs)
 
         # Preserve file extension for processor detection
         ext = Path(s3_key).suffix
