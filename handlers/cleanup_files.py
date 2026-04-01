@@ -53,8 +53,7 @@ def cleanup_old_files():
         deleted_count = 0
         for doc in old_docs:
             try:
-                if settings.use_s3 and doc.file_path:
-                    # Delete from S3
+                if doc.file_path:
                     try:
                         from storage.s3_service import S3StorageService
                         s3 = S3StorageService()
@@ -64,11 +63,6 @@ def cleanup_old_files():
                         logger.info(f"Deleted S3 object: {doc.file_path}")
                     except Exception as e:
                         logger.error(f"Error deleting S3 object {doc.file_path}: {e}")
-                else:
-                    # Local filesystem (dev only)
-                    file_path = Path(doc.file_path)
-                    if file_path.exists():
-                        file_path.unlink()
 
                 db.delete(doc)
                 deleted_count += 1

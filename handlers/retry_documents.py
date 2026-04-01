@@ -74,7 +74,7 @@ def retry_failed_documents():
 
         for doc in failed_docs:
             # Check if file still exists in S3
-            if settings.use_s3 and doc.file_path:
+            if doc.file_path:
                 try:
                     s3_kwargs = {"region_name": settings.aws_region}
                     if settings.aws_access_key_id and settings.aws_secret_access_key:

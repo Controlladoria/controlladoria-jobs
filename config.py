@@ -138,7 +138,7 @@ class Settings(BaseSettings):
     aws_region: str = "us-east-1"
     s3_bucket_name: str = ""
     s3_endpoint_url: str = ""  # Optional: for S3-compatible services
-    use_s3: bool = False  # Set to True to use S3 instead of local filesystem
+    use_s3: bool = True  # S3 is the standard. Only set False for local dev without AWS credentials
 
     # AWS SQS (Document Processing Queue)
     sqs_document_queue_url: str = ""  # SQS queue URL for retry → reprocess flow
