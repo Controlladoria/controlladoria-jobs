@@ -29,6 +29,7 @@ reportlab>=4.0.0
 # Web Framework (needed for shared router helper functions)
 fastapi>=0.109.0
 python-multipart>=0.0.9
+slowapi>=0.1.9
 
 # Database
 sqlalchemy>=2.0.0
