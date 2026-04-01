@@ -54,6 +54,11 @@ def handler(event, context):
         try:
             # Run the actual document processing
             _process_document(document_id, local_path)
+        except Exception as e:
+            logger.error(f"Document {document_id} processing failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            _mark_document_failed(document_id, f"Erro no processamento: {e}")
         finally:
             # Clean up temp file
             try:
