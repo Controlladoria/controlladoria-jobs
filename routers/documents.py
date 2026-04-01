@@ -390,8 +390,56 @@ def log_audit_trail(
     )
 
 
-# find_or_create_client and process_document_background have been moved to
-# controlladoria-jobs Lambda. Document processing now happens via SQS.
+def find_or_create_client(db: Session, user_id: int, party_data: dict, client_type: str) -> Optional[int]:
+    """
+    Find or create a client based on issuer/recipient data.
+    Matches by tax_id first, then name. Creates if not found.
+    """
+    if not party_data or not isinstance(party_data, dict):
+        return None
+
+    name = party_data.get("name")
+    if not name:
+        return None
+
+    tax_id = party_data.get("tax_id")
+
+    # Try to find existing client by tax_id first
+    if tax_id:
+        existing = db.query(Client).filter(
+            Client.user_id == user_id,
+            Client.tax_id == tax_id
+        ).first()
+        if existing:
+            return existing.id
+
+    # Try to find by name (case-insensitive)
+    existing = db.query(Client).filter(
+        Client.user_id == user_id,
+        Client.name.ilike(name)
+    ).first()
+    if existing:
+        return existing.id
+
+    # Create new client
+    try:
+        new_client = Client(
+            user_id=user_id,
+            name=name,
+            legal_name=party_data.get("legal_name"),
+            tax_id=tax_id,
+            email=party_data.get("email"),
+            phone=party_data.get("phone"),
+            address=party_data.get("address"),
+            client_type=client_type,
+            is_active=True,
+        )
+        db.add(new_client)
+        db.flush()
+        return new_client.id
+    except Exception as e:
+        logger.warning(f"Could not create client {name}: {e}")
+        return None
 
 
 def _handle_nfe_cancellation(db: Session, doc: "Document", data_dict: dict):

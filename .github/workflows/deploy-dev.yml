@@ -198,5 +198,24 @@ jobs:
               --targets "Id=retry-documents,Arn=$FN_ARN"
           fi
 
+      - name: Clean up old ECR images
+        run: |
+          # Keep the 5 most recent images, delete the rest
+          IMAGES=$(aws ecr describe-images --repository-name $ECR_REPOSITORY \
+            --query 'sort_by(imageDetails,&imagePushedAt)[*].imageDigest' --output text)
+          COUNT=$(echo "$IMAGES" | wc -w)
+          if [ "$COUNT" -gt 5 ]; then
+            DELETE_COUNT=$((COUNT - 5))
+            TO_DELETE=$(echo "$IMAGES" | tr '\t' '\n' | head -n $DELETE_COUNT)
+            for digest in $TO_DELETE; do
+              echo "Deleting old image: $digest"
+              aws ecr batch-delete-image --repository-name $ECR_REPOSITORY \
+                --image-ids imageDigest="$digest" --no-cli-pager || true
+            done
+            echo "Cleaned up $DELETE_COUNT old images"
+          else
+            echo "Only $COUNT images, nothing to clean up"
+          fi
+
       - name: Summary
         run: echo "Dev deploy complete — image ${{ steps.build-image.outputs.image }}"

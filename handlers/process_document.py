@@ -130,9 +130,9 @@ def _process_document(document_id: int, file_path: str):
         _create_validation_rows,
         _batch_categorize_uncategorized_rows,
         _normalize_nf_number,
-        get_friendly_error_message,
         find_or_create_client,
     )
+    from i18n_errors import get_friendly_error_message
     from auth.team_management import get_organization_owner_id
     from accounting.categories import resolve_category_name
     from accounting import is_income_type
