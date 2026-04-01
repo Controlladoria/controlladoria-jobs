@@ -8,7 +8,8 @@ import io
 import logging
 from typing import Optional, Tuple
 from openai import OpenAI
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 logger = logging.getLogger(__name__)
 
@@ -88,14 +89,14 @@ Extract numeros apenas (only numbers), remove all formatting."""
 
         if ai_provider == "gemini":
             from PIL import Image
-            genai.configure(api_key=api_key)
-            gemini_model = genai.GenerativeModel(model)
+            gemini_client = genai.Client(api_key=api_key)
 
             image_bytes = base64.b64decode(file_data)
             image = Image.open(io.BytesIO(image_bytes))
-            response = gemini_model.generate_content(
-                [prompt, image],
-                generation_config=genai.types.GenerationConfig(max_output_tokens=300, temperature=0.1),
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=[prompt, image],
+                config=genai_types.GenerateContentConfig(max_output_tokens=300, temperature=0.1),
             )
             result_text = response.text
 

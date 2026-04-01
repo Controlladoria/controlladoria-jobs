@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from pdf2image import convert_from_path
 from PIL import Image
 
@@ -185,8 +186,7 @@ class StructuredDocumentProcessor:
                 logger.info(f"✓ OpenAI client initialized (model: {self.openai_model}, keys: {len(openai_keys)})")
             elif provider == "gemini" and self.key_pool.has_provider("gemini"):
                 first_key = gemini_keys[0] if gemini_keys else ""
-                genai.configure(api_key=first_key)
-                client = genai.GenerativeModel(self.gemini_model)
+                client = genai.Client(api_key=first_key)
                 self._clients[first_key[-6:]] = ("gemini", client)
                 if not self.client:
                     self.client = client
@@ -332,8 +332,7 @@ class StructuredDocumentProcessor:
                 http_client=httpx.Client(limits=limits),
             )
         elif provider == "gemini":
-            genai.configure(api_key=api_key)
-            client = genai.GenerativeModel(self.gemini_model)
+            client = genai.Client(api_key=api_key)
         elif provider == "nova":
             import boto3
             client = boto3.client("bedrock-runtime", region_name=self.nova_region)
@@ -1805,9 +1804,10 @@ class StructuredDocumentProcessor:
                     )
                     raw = response.choices[0].message.content or "{}"
                 elif self.ai_provider == "gemini":
-                    response = self._active_client.generate_content(
-                        prompt,
-                        generation_config=genai.types.GenerationConfig(
+                    response = self._active_client.models.generate_content(
+                        model=self.gemini_model,
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(
                             max_output_tokens=4000,
                             temperature=0.1,
                         ),
@@ -2276,10 +2276,11 @@ Important rules for Brazilian documents:
 
             prompt = self._get_extraction_prompt(self.user_company_info)
 
-            model = self._active_client  # GenerativeModel instance
-            response = model.generate_content(
-                [prompt, image],
-                generation_config=genai.types.GenerationConfig(
+            gemini_client = self._active_client  # genai.Client instance
+            response = gemini_client.models.generate_content(
+                model=self.gemini_model,
+                contents=[prompt, image],
+                config=genai_types.GenerateContentConfig(
                     max_output_tokens=16000,
                     temperature=0.1,
                 ),
@@ -2312,13 +2313,14 @@ Important rules for Brazilian documents:
 
             prompt = self._get_extraction_prompt(self.user_company_info)
 
-            model = self._active_client
-            response = model.generate_content(
-                [
+            gemini_client = self._active_client
+            response = gemini_client.models.generate_content(
+                model=self.gemini_model,
+                contents=[
                     prompt,
-                    {"mime_type": "application/pdf", "data": pdf_bytes},
+                    genai_types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
                 ],
-                generation_config=genai.types.GenerationConfig(
+                config=genai_types.GenerateContentConfig(
                     max_output_tokens=16000,
                     temperature=0.1,
                 ),
@@ -2348,10 +2350,11 @@ Important rules for Brazilian documents:
         def _call_gemini():
             prompt = f"{self._get_extraction_prompt(self.user_company_info)}\n\nDADOS DO EXCEL:\n{excel_text}"
 
-            model = self._active_client
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
+            gemini_client = self._active_client
+            response = gemini_client.models.generate_content(
+                model=self.gemini_model,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
                     max_output_tokens=16000,
                     temperature=0.1,
                 ),
@@ -2376,10 +2379,11 @@ Important rules for Brazilian documents:
         prompt = self._build_columns_prompt(df)
 
         def _call_gemini():
-            model = self._active_client
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
+            gemini_client = self._active_client
+            response = gemini_client.models.generate_content(
+                model=self.gemini_model,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
                     max_output_tokens=4000,
                     temperature=0.1,
                 ),
