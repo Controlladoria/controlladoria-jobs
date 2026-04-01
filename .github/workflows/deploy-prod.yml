@@ -48,7 +48,7 @@ jobs:
       - name: Create ECR repository if missing
         run: |
           aws ecr describe-repositories --repository-names $ECR_REPOSITORY 2>/dev/null || \
-            aws ecr create-repository --repository-name $ECR_REPOSITORY --image-scanning-configuration scanOnPush=true
+            aws ecr create-repository --repository-name $ECR_REPOSITORY --image-scanning-configuration scanOnPush=true || true
 
       - name: Build, tag, and push image to ECR
         id: build-image
