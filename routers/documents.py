@@ -67,7 +67,7 @@ from models import (
 )
 from storage.s3_service import s3_storage
 from structured_processor import StructuredDocumentProcessor
-from tasks.queue_manager import DocumentQueueManager, trigger_next_queued_document
+# queue_manager replaced by SQS → Lambda processing
 from validators import FinancialDataValidator
 from auth.team_management import get_organization_owner_id
 from auth.models import KnownItemResponse, KnownItemUpdate
@@ -92,9 +92,12 @@ limiter = Limiter(key_func=get_remote_address)
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
-# Uploads directory
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+# Uploads directory (skip mkdir in Lambda — read-only filesystem, only /tmp is writable)
+UPLOAD_DIR = Path("/tmp/uploads") if os.environ.get("AWS_LAMBDA_FUNCTION_NAME") else Path("uploads")
+try:
+    UPLOAD_DIR.mkdir(exist_ok=True)
+except OSError:
+    pass  # Lambda read-only filesystem — S3 is used instead
 
 # Initialize processor
 processor = StructuredDocumentProcessor()
@@ -387,64 +390,8 @@ def log_audit_trail(
     )
 
 
-def find_or_create_client(db: Session, user_id: int, party_data: dict, client_type: str) -> Optional[int]:
-    """
-    Find or create a client based on issuer/recipient data
-
-    Args:
-        db: Database session
-        user_id: User ID
-        party_data: Issuer or recipient data dict
-        client_type: 'supplier' or 'customer'
-
-    Returns:
-        Client ID if found/created, None otherwise
-    """
-    if not party_data or not isinstance(party_data, dict):
-        return None
-
-    name = party_data.get("name")
-    if not name:
-        return None
-
-    tax_id = party_data.get("tax_id")
-
-    # Try to find existing client by tax_id first (more reliable)
-    if tax_id:
-        existing = db.query(Client).filter(
-            Client.user_id == user_id,
-            Client.tax_id == tax_id
-        ).first()
-        if existing:
-            return existing.id
-
-    # Try to find by name (case-insensitive)
-    existing = db.query(Client).filter(
-        Client.user_id == user_id,
-        Client.name.ilike(name)
-    ).first()
-    if existing:
-        return existing.id
-
-    # Create new client
-    try:
-        new_client = Client(
-            user_id=user_id,
-            name=name,
-            legal_name=party_data.get("legal_name"),
-            tax_id=tax_id,
-            email=party_data.get("email"),
-            phone=party_data.get("phone"),
-            address=party_data.get("address"),
-            client_type=client_type,
-            is_active=True
-        )
-        db.add(new_client)
-        db.flush()  # Get ID without committing
-        return new_client.id
-    except Exception as e:
-        logger.warning(f"⚠️  Could not create client {name}: {e}")
-        return None
+# find_or_create_client and process_document_background have been moved to
+# controlladoria-jobs Lambda. Document processing now happens via SQS.
 
 
 def _handle_nfe_cancellation(db: Session, doc: "Document", data_dict: dict):
@@ -845,279 +792,44 @@ def _create_validation_rows(db: Session, doc: "Document", data_dict: dict):
     )
 
 
-def process_document_background(document_id: int, file_path: str):
-    """
-    Background task to process a document
-    Creates its own database session to avoid session issues
-    """
-    from database import SessionLocal
+# process_document_background has been moved to controlladoria-jobs Lambda.
+# Documents are now processed via: API upload → S3 → SQS → Lambda
 
-    db = SessionLocal()
+
+def _send_sqs_message(document_id: int, file_path: str):
+    """Send a document processing message to SQS for Lambda pickup."""
+    import json
+    import boto3
+
     try:
-        # Background processing started
-
-        # Get document
-        doc = db.query(Document).filter(Document.id == document_id).first()
-        if not doc:
-            logger.error(f"❌ Document ID={document_id} not found")
-            return
-
-        # Get user company info for income/expense detection
-        user = db.query(User).filter(User.id == doc.user_id).first()
-        user_company_info = None
-        if user:
-            user_company_info = {
-                "company_name": user.company_name or user.full_name,
-                "legal_name": user.full_name,
-                "cnpj": user.cnpj,
-            }
-            logger.info(f"👤 User context: {user.company_name or user.full_name} (CNPJ: {user.cnpj})")
-
-        # Update status to processing
-        doc.status = DocumentStatus.PROCESSING
-        db.commit()
-
-        # Fetch known items for AI context
-        known_items_context = []
-        try:
-            owner_id = get_organization_owner_id(user) if user else None
-            if owner_id:
-                known_items_context = _get_known_items_for_prompt(db, owner_id)
-                if known_items_context:
-                    logger.info(f"📋 Injecting {len(known_items_context)} known items into AI prompt")
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to load known items (non-critical): {e}")
-
-        # Process document with user context
-        try:
-            result = processor.process_document(
-                file_path,
-                user_company_info=user_company_info,
-                known_items=known_items_context if known_items_context else None,
-            )
-
-            if result["status"] == "success":
-                # Validate extracted data
-                from validation import FinancialValidator
-
-                extracted_data = result["extracted_data"]
-
-                # Fix document_number if it's a temp filename (e.g. tmpXXX.xlsx)
-                doc_num = extracted_data.document_number
-                if doc_num and ("tmp" in doc_num.lower() and doc_num.lower().endswith((".xlsx", ".xls", ".csv"))):
-                    # Use the original upload filename instead of temp path
-                    extracted_data.document_number = doc.file_name
-
-                data_dict = extracted_data.model_dump()
-
-                validator = FinancialValidator()
-                is_valid, errors, warnings = validator.validate_document(data_dict)
-
-                # Save extracted data with validation results
-                doc.extracted_data_json = extracted_data.model_dump_json()
-                # Item 9: Set to PENDING_VALIDATION instead of COMPLETED
-                # Documents must be reviewed by user before appearing in reports
-                doc.status = DocumentStatus.PENDING_VALIDATION
-                doc.processed_date = datetime.utcnow()
-
-                # Extract department/category for indexing (resolve to V2 name)
-                if "category" in data_dict:
-                    from accounting.categories import resolve_category_name
-                    doc.category = resolve_category_name(data_dict.get("category"))
-                if "department" in data_dict:
-                    doc.department = data_dict.get("department")
-
-                # Auto-create/match client from issuer/recipient
-                from accounting import is_income_type
-                transaction_type = data_dict.get("transaction_type")
-                if transaction_type and not is_income_type(transaction_type):
-                    # For expenses/costs, the issuer is the supplier
-                    issuer = data_dict.get("issuer")
-                    if issuer:
-                        client_id = find_or_create_client(db, doc.user_id, issuer, "supplier")
-                        if client_id:
-                            doc.client_id = client_id
-                elif transaction_type and is_income_type(transaction_type):
-                    # For income, the recipient is the customer
-                    recipient = data_dict.get("recipient")
-                    if recipient:
-                        client_id = find_or_create_client(db, doc.user_id, recipient, "customer")
-                        if client_id:
-                            doc.client_id = client_id
-
-                # Log validation results
-                if not is_valid:
-                    logger.warning(
-                        f"⚠️  Validation errors for document {document_id}: {errors}"
-                    )
-                if warnings:
-                    logger.info(f"⚠️  Validation warnings for document {document_id}: {warnings}")
-
-                # Force all line item descriptions to UPPERCASE
-                if data_dict.get("line_items"):
-                    for item in data_dict["line_items"]:
-                        if item.get("description"):
-                            item["description"] = item["description"].upper()
-                    # Re-serialize with uppercased descriptions
-                    doc.extracted_data_json = json.dumps(data_dict, default=str)
-
-                # Force transaction descriptions to UPPERCASE
-                if data_dict.get("transactions"):
-                    for txn in data_dict["transactions"]:
-                        if txn.get("description"):
-                            txn["description"] = txn["description"].upper()
-                    doc.extracted_data_json = json.dumps(data_dict, default=str)
-
-                # Post-processing CNPJ check: detect mismatched CNPJs
-                # This catches CNPJ cards and any doc with a different company's CNPJ
-                if user and user.cnpj and not doc.cnpj_mismatch:
-                    import re as _re
-                    user_cnpj_clean = _re.sub(r'\D', '', user.cnpj or '')
-                    # Collect all CNPJs from the document
-                    doc_cnpjs = set()
-                    for party_key in ('issuer', 'recipient'):
-                        party = data_dict.get(party_key)
-                        if isinstance(party, dict) and party.get('tax_id'):
-                            clean = _re.sub(r'\D', '', party['tax_id'])
-                            if len(clean) == 14:  # CNPJ length
-                                doc_cnpjs.add(clean)
-
-                    # Also check org CNPJs the user has access to
-                    known_cnpjs = {user_cnpj_clean} if user_cnpj_clean else set()
-                    try:
-                        from database import Organization, OrgMembership
-                        org_ids = [m.organization_id for m in db.query(OrgMembership).filter(OrgMembership.user_id == user.id).all()]
-                        if org_ids:
-                            orgs = db.query(Organization).filter(Organization.id.in_(org_ids)).all()
-                            for org in orgs:
-                                if org.cnpj:
-                                    known_cnpjs.add(_re.sub(r'\D', '', org.cnpj))
-                    except Exception:
-                        pass
-
-                    # Check if any document CNPJ is unknown
-                    unknown_cnpjs = doc_cnpjs - known_cnpjs - {''}
-                    if unknown_cnpjs:
-                        mismatched = list(unknown_cnpjs)[0]
-                        formatted = f"{mismatched[:2]}.{mismatched[2:5]}.{mismatched[5:8]}/{mismatched[8:12]}-{mismatched[12:]}"
-                        doc.cnpj_mismatch = True
-                        doc.cnpj_warning_message = f"CNPJ {formatted} não está cadastrado na sua conta. Deseja criar uma nova empresa?"
-                        logger.warning(f"⚠️  Unknown CNPJ {formatted} found in document {document_id}")
-
-                # Check for duplicate NFe by document_number (NF ID)
-                doc_number = data_dict.get("document_number")
-                doc_type = data_dict.get("document_type", "")
-                if doc_number and doc_type in ("invoice", "nfe", "nota_fiscal"):
-                    from routers.documents import _normalize_nf_number
-                    normalized = _normalize_nf_number(doc_number)
-                    if normalized:
-                        existing_docs = db.query(Document).filter(
-                            Document.user_id == doc.user_id,
-                            Document.id != doc.id,
-                            Document.status.in_([
-                                DocumentStatus.COMPLETED,
-                                DocumentStatus.PENDING_VALIDATION,
-                            ]),
-                            Document.is_cancellation == False,
-                        ).all()
-
-                        for existing in existing_docs:
-                            if not existing.extracted_data_json:
-                                continue
-                            try:
-                                existing_data = json.loads(existing.extracted_data_json)
-                                existing_number = existing_data.get("document_number", "")
-                                if _normalize_nf_number(existing_number) == normalized:
-                                    # Duplicate NFe found - mark as failed
-                                    existing_issuer = existing_data.get("issuer", {})
-                                    issuer_name = existing_issuer.get("name", "") if isinstance(existing_issuer, dict) else ""
-                                    days_ago = (datetime.utcnow() - existing.upload_date).days
-                                    doc.status = DocumentStatus.FAILED
-                                    doc.error_message = (
-                                        f"NFe duplicada: já existe uma nota fiscal com número {doc_number}"
-                                        f"{f' (emissor: {issuer_name})' if issuer_name else ''}"
-                                        f" enviada há {days_ago} dia(s). ID: {existing.id}"
-                                    )
-                                    logger.warning(f"⚠️  Duplicate NFe detected: NF#{doc_number} (existing doc ID: {existing.id})")
-                                    db.commit()
-                                    return
-                            except (json.JSONDecodeError, TypeError):
-                                continue
-
-                # Item 4: Handle NFe cancellation linking
-                if data_dict.get("is_cancellation") and data_dict.get("original_document_number"):
-                    _handle_nfe_cancellation(db, doc, data_dict)
-
-                # Item 9: Create validation rows from extracted data
-                _create_validation_rows(db, doc, data_dict)
-
-                # Post-process: batch-categorize any uncategorized validation rows
-                try:
-                    _batch_categorize_uncategorized_rows(db, doc, processor)
-                except Exception as e:
-                    logger.warning(f"⚠️ Post-processing categorization failed (non-critical): {e}")
-
-                # Log audit trail (document created via upload)
-                audit_entry = AuditLog(
-                    user_id=doc.user_id,
-                    document_id=doc.id,
-                    action="create",
-                    entity_type="document",
-                    entity_id=doc.id,
-                    after_value=doc.extracted_data_json,
-                    changes_summary=f"Document uploaded and processed: {doc.file_name}",
-                )
-                db.add(audit_entry)
-
-            else:
-                error_msg = result.get("error", "Unknown error")
-                doc.status = DocumentStatus.FAILED
-                doc.error_message = error_msg
-                # Check if all retries exhausted
-                if doc.retry_count >= settings.document_max_retries:
-                    doc.max_retries_exhausted = True
-                    logger.warning(
-                        f"⚠️ Document {document_id} exhausted all {doc.retry_count} retries"
-                    )
-                logger.error(
-                    f"❌ Background processing FAILED for ID={document_id}: {error_msg}"
-                )
-
-            db.commit()
-
-        except Exception as e:
-            # Log technical error in English for developers
-            logger.error(
-                f"❌ EXCEPTION during background processing ID={document_id}: {type(e).__name__}: {str(e)}"
-            )
-            import traceback
-            logger.error(f"   Traceback:\n{traceback.format_exc()}")
-
-            # Translate error to Portuguese for user
-            error_msg = get_friendly_error_message(e)
-            doc.status = DocumentStatus.FAILED
-            doc.error_message = error_msg
-            # Check if all retries exhausted
-            if doc.retry_count >= settings.document_max_retries:
-                doc.max_retries_exhausted = True
-                logger.warning(
-                    f"⚠️ Document {document_id} exhausted all {doc.retry_count} retries"
-                )
-            db.commit()
-
+        sqs = boto3.client(
+            "sqs",
+            region_name=settings.aws_region,
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+        )
+        sqs.send_message(
+            QueueUrl=settings.sqs_document_queue_url,
+            MessageBody=json.dumps({
+                "document_id": document_id,
+                "file_path": file_path,
+            }),
+        )
+        logger.info(f"📤 SQS message sent for document {document_id}")
     except Exception as e:
-        logger.error(f"❌ CRITICAL ERROR in background task: {e}")
-        import traceback
-
-        logger.error(f"   Traceback:\n{traceback.format_exc()}")
-    finally:
-        db.close()  # Always close the session
-
-        # Trigger next queued document (if any)
+        logger.error(f"❌ Failed to send SQS message for document {document_id}: {e}")
+        # Mark document as failed so retry Lambda can pick it up later
+        from database import SessionLocal
+        db = SessionLocal()
         try:
-            trigger_next_queued_document(process_document_background)
-        except Exception as e:
-            logger.error(f"Queue: Failed to trigger next document: {e}")
+            doc = db.query(Document).filter(Document.id == document_id).first()
+            if doc:
+                doc.status = DocumentStatus.FAILED
+                doc.error_message = f"Falha ao enviar para processamento: {str(e)}"
+                db.commit()
+        finally:
+            db.close()
+
 
 
 # =============================================================================
@@ -1347,33 +1059,16 @@ async def upload_document(
         db.commit()
         db.refresh(doc)
 
-        # Enqueue document for processing (respects MAX_CONCURRENT limit)
-        queue_manager = DocumentQueueManager(db)
-        enqueue_result = queue_manager.enqueue(
-            document_id=doc.id,
-            file_path=str(file_path),
-            process_func=process_document_background,
-            background_tasks=background_tasks,
-        )
+        # Send to SQS for Lambda processing (replaces in-process background task)
+        _send_sqs_message(document_id=doc.id, file_path=str(file_path))
 
-        if enqueue_result.queued:
-            logger.info(
-                f"📤 Document queued at position {enqueue_result.queue_position}: ID={doc.id}"
-            )
-            return DocumentUploadResponse(
-                id=doc.id,
-                file_name=doc.file_name,
-                status=DocumentStatus.PENDING.value,
-                message=enqueue_result.message,
-            )
-        else:
-            logger.info(f"📤 Document processing immediately: ID={doc.id}")
-            return DocumentUploadResponse(
-                id=doc.id,
-                file_name=doc.file_name,
-                status=DocumentStatus.PROCESSING.value,
-                message=enqueue_result.message,
-            )
+        logger.info(f"📤 Document sent to SQS for processing: ID={doc.id}")
+        return DocumentUploadResponse(
+            id=doc.id,
+            file_name=doc.file_name,
+            status=DocumentStatus.PENDING.value,
+            message="Documento enviado para processamento. Será processado em breve.",
+        )
 
     except Exception as e:
         # Log technical error in English for developers
@@ -1501,24 +1196,15 @@ async def bulk_upload_documents(
             db.commit()
             db.refresh(doc)
 
-            # Enqueue for background processing (respects concurrent limit)
-            queue_manager = DocumentQueueManager(db)
-            enqueue_result = queue_manager.enqueue(
-                document_id=doc.id,
-                file_path=str(file_path),
-                process_func=process_document_background,
-                background_tasks=background_tasks,
-            )
+            # Send to SQS for Lambda processing
+            _send_sqs_message(document_id=doc.id, file_path=str(file_path))
 
             uploaded_documents.append(
                 {
                     "id": doc.id,
                     "file_name": doc.file_name,
-                    "status": DocumentStatus.PENDING.value
-                    if enqueue_result.queued
-                    else DocumentStatus.PROCESSING.value,
-                    "queue_position": enqueue_result.queue_position,
-                    "message": enqueue_result.message,
+                    "status": DocumentStatus.PENDING.value,
+                    "message": "Enviado para processamento",
                 }
             )
 
@@ -1546,11 +1232,21 @@ async def get_queue_status(
     """
     Get current document processing queue status.
 
-    Returns number of documents being processed, queue length,
-    available slots, and estimated wait time.
+    Documents are now processed via SQS → Lambda, so this returns
+    counts from the database instead of the in-process queue.
     """
-    queue_manager = DocumentQueueManager(db)
-    return queue_manager.get_queue_status()
+    pending = db.query(Document).filter(
+        Document.status == DocumentStatus.PENDING
+    ).count()
+    processing = db.query(Document).filter(
+        Document.status == DocumentStatus.PROCESSING
+    ).count()
+    return {
+        "processing": processing,
+        "queued": pending,
+        "available_slots": None,  # Lambda scales automatically
+        "message": "Processamento via Lambda (escala automaticamente)",
+    }
 
 
 @router.post("/upload/csv")
@@ -2239,6 +1935,75 @@ async def create_manual_document(
         raise HTTPException(
             status_code=400, detail=f"Erro ao criar documento manual: {str(e)}"
         )
+
+
+@router.post("/{document_id}/retry")
+async def retry_document(
+    document_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually retry processing a failed document.
+    Resets status to PENDING and sends to SQS for Lambda reprocessing.
+    """
+    doc = db.query(Document).filter(Document.id == document_id).first()
+
+    if not doc or not verify_document_access(doc, current_user, db):
+        raise HTTPException(status_code=404, detail=msg["document_not_found"])
+
+    if doc.status != DocumentStatus.FAILED:
+        raise HTTPException(
+            status_code=400,
+            detail="Apenas documentos com falha podem ser reprocessados.",
+        )
+
+    # Check file still exists in S3
+    if doc.file_path and settings.use_s3:
+        try:
+            s3_storage.s3_client.head_object(Bucket=s3_storage.bucket_name, Key=doc.file_path)
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Arquivo original não encontrado no S3. Faça upload novamente.",
+            )
+
+    # Reset status and clear error
+    doc.status = DocumentStatus.PENDING
+    doc.error_message = None
+    doc.retry_count = (doc.retry_count or 0) + 1
+    doc.max_retries_exhausted = False
+
+    # Delete old validation rows if any
+    db.query(DocumentValidationRow).filter(
+        DocumentValidationRow.document_id == document_id
+    ).delete()
+
+    db.commit()
+
+    # Send to SQS for reprocessing
+    _send_sqs_message(doc.id, doc.file_path)
+
+    log_audit_trail(
+        db=db,
+        user_id=current_user.id,
+        action="retry",
+        entity_type="document",
+        entity_id=document_id,
+        changes_summary=f"Document retry requested: {doc.file_name} (attempt {doc.retry_count})",
+        request=request,
+        document_id=document_id,
+    )
+
+    logger.info(f"Document {document_id} retry requested by user {current_user.id} (attempt {doc.retry_count})")
+
+    return {
+        "document_id": document_id,
+        "status": "pending",
+        "message": "Documento enviado para reprocessamento.",
+        "retry_count": doc.retry_count,
+    }
 
 
 @router.delete("/{document_id}")
@@ -3160,13 +2925,14 @@ async def confirm_document_validation(
 @router.post("/{document_id}/reject-validation")
 async def reject_document_validation(
     document_id: int,
+    request: Request,
     body: dict = None,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
     """
     Reject a document during validation (Item 9).
-    Marks the document as FAILED with a rejection reason.
+    Fully deletes the document (file + DB record) on rejection.
     """
     doc = db.query(Document).filter(Document.id == document_id).first()
 
@@ -3181,28 +2947,40 @@ async def reject_document_validation(
 
     reason = (body or {}).get("reason", "Rejeitado pelo usuário durante validação")
 
-    doc.status = DocumentStatus.FAILED
-    doc.error_message = reason
-    db.commit()
+    # Delete the actual file (skip for manual entries and CSV imports)
+    if doc.file_type not in ["manual", "csv_import"]:
+        try:
+            if settings.use_s3:
+                s3_storage.delete_file(doc.file_path)
+            else:
+                file_path = Path(doc.file_path)
+                if file_path.exists():
+                    file_path.unlink()
+        except Exception as e:
+            logger.warning(f"Could not delete file {doc.file_path}: {e}")
 
-    # Audit trail
-    audit_entry = AuditLog(
+    # Audit trail BEFORE deleting the record
+    log_audit_trail(
+        db=db,
         user_id=current_user.id,
-        document_id=doc.id,
         action="reject",
         entity_type="document",
-        entity_id=doc.id,
-        changes_summary=f"Document rejected during validation: {reason}",
+        entity_id=document_id,
+        changes_summary=f"Document rejected and deleted during validation: {reason}",
+        request=request,
+        document_id=document_id,
     )
-    db.add(audit_entry)
+
+    # Delete the document record (validation_rows cascade-deleted automatically)
+    db.delete(doc)
     db.commit()
 
-    logger.info(f"❌ Document {document_id} rejected by user {current_user.id}: {reason}")
+    logger.info(f"Document {document_id} rejected and deleted by user {current_user.id}: {reason}")
 
     return {
         "document_id": document_id,
-        "status": "failed",
-        "message": "Documento rejeitado.",
+        "status": "deleted",
+        "message": "Documento rejeitado e removido.",
     }
 
 

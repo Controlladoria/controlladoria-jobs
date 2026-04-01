@@ -24,15 +24,15 @@ class S3StorageService:
         self.use_s3 = settings.use_s3
 
         if self.use_s3:
-            # Initialize S3 client with credentials from environment
-            self.s3_client = boto3.client(
-                "s3",
-                aws_access_key_id=settings.aws_access_key_id,
-                aws_secret_access_key=settings.aws_secret_access_key,
-                region_name=settings.aws_region,
-                endpoint_url=settings.s3_endpoint_url
-                or None,  # For S3-compatible services
-            )
+            # Let boto3 handle credentials automatically.
+            # In Lambda: uses execution role (STS temp creds with session token).
+            # In Railway/local: uses env vars or ~/.aws/credentials.
+            # NEVER pass settings.aws_access_key_id explicitly — pydantic picks up
+            # Lambda's auto-injected STS creds without the session token, causing 403.
+            s3_kwargs = {"region_name": settings.aws_region}
+            if settings.s3_endpoint_url:
+                s3_kwargs["endpoint_url"] = settings.s3_endpoint_url
+            self.s3_client = boto3.client("s3", **s3_kwargs)
             self.bucket_name = settings.s3_bucket_name
 
             # Validate bucket exists
