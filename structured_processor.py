@@ -91,7 +91,7 @@ class StructuredDocumentProcessor:
         # Retry configuration
         self.max_retries = int(os.getenv("AI_MAX_RETRIES", "3"))
         self.retry_delay = int(os.getenv("AI_RETRY_DELAY", "1"))
-        self.timeout = int(os.getenv("AI_TIMEOUT", "120"))
+        self.timeout = int(os.getenv("AI_TIMEOUT", "300"))  # 5 min — OpenAI gpt-5-mini can take 2-3 min on heavy chunks
 
         # Failover configuration
         self.ai_failover_enabled = os.getenv("AI_FAILOVER_ENABLED", "true").lower() == "true"
@@ -1002,7 +1002,7 @@ class StructuredDocumentProcessor:
         # Chunk sizes per provider based on output token limits
         # Nova excluded from chunking — its output cap is too low for spreadsheet JSON,
         # causing constant truncation. Nova is still used for images/PDFs/small docs.
-        CHUNK_SIZES = {"gemini": 100, "openai": 100}
+        CHUNK_SIZES = {"gemini": 100, "openai": 50}
         EXCLUDED_FROM_CHUNKS = {"nova"}  # providers that can't handle spreadsheet output
         DEFAULT_CHUNK_SIZE = 100
 
