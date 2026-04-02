@@ -86,7 +86,7 @@ class Settings(BaseSettings):
     # OpenAI — tertiary fallback
     openai_api_key: str = ""
     openai_api_keys: str = ""  # Comma-separated for round-robin: "sk-key1,sk-key2"
-    openai_model: str = "gpt-5.4-nano"  # Cheapest: $0.20/1M input, $1.25/1M output
+    openai_model: str = "gpt-5-mini"  # Best value: $0.25/1M input, $2.00/1M output, 2.5x higher rate limits than nano
 
     # AI Failover & Key Pool
     ai_failover_enabled: bool = True  # Auto-switch provider when all keys for primary fail

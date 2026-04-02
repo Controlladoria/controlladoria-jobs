@@ -74,7 +74,7 @@ class StructuredDocumentProcessor:
         raw_provider = AI_PROVIDER or "gemini"
         self.ai_providers = [p.strip() for p in raw_provider.split(",") if p.strip()]
         self.ai_provider = self.ai_providers[0]  # backward compat: first is "primary"
-        logger.info(
+        logger.debug(
             f"Initializing StructuredDocumentProcessor with AI provider(s): {', '.join(self.ai_providers)}"
         )
 
@@ -91,7 +91,7 @@ class StructuredDocumentProcessor:
         # Retry configuration
         self.max_retries = int(os.getenv("AI_MAX_RETRIES", "3"))
         self.retry_delay = int(os.getenv("AI_RETRY_DELAY", "1"))
-        self.timeout = int(os.getenv("AI_TIMEOUT", "60"))
+        self.timeout = int(os.getenv("AI_TIMEOUT", "120"))
 
         # Failover configuration
         self.ai_failover_enabled = os.getenv("AI_FAILOVER_ENABLED", "true").lower() == "true"
@@ -103,7 +103,7 @@ class StructuredDocumentProcessor:
                 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
                 self.cache = redis.from_url(redis_url, decode_responses=True)
                 self.cache.ping()  # Test connection
-                logger.info(f"✓ Redis cache enabled (TTL: {self.cache_ttl}s)")
+                logger.debug(f"Redis cache enabled (TTL: {self.cache_ttl}s)")
             except Exception as e:
                 logger.warning(f"⚠️  Redis connection failed, caching disabled: {e}")
                 self.cache = None
@@ -183,28 +183,28 @@ class StructuredDocumentProcessor:
                 self._clients[first_key[-6:]] = ("openai", client)
                 if not self.client:
                     self.client = client
-                logger.info(f"✓ OpenAI client initialized (model: {self.openai_model}, keys: {len(openai_keys)})")
+                logger.debug(f"OpenAI client initialized (model: {self.openai_model}, keys: {len(openai_keys)})")
             elif provider == "gemini" and self.key_pool.has_provider("gemini"):
                 first_key = gemini_keys[0] if gemini_keys else ""
                 client = genai.Client(api_key=first_key)
                 self._clients[first_key[-6:]] = ("gemini", client)
                 if not self.client:
                     self.client = client
-                logger.info(f"✓ Gemini client initialized (model: {self.gemini_model}, keys: {len(gemini_keys)})")
+                logger.debug(f"Gemini client initialized (model: {self.gemini_model}, keys: {len(gemini_keys)})")
             elif provider == "nova" and self.key_pool.has_provider("nova"):
                 import boto3
                 client = boto3.client("bedrock-runtime", region_name=self.nova_region)
                 self._clients["iam-cr"] = ("nova", client)
                 if not self.client:
                     self.client = client
-                logger.info(f"✓ Nova/Bedrock client initialized (model: {self.nova_model}, region: {self.nova_region})")
+                logger.debug(f"Nova/Bedrock client initialized (model: {self.nova_model}, region: {self.nova_region})")
 
         # Log provider chain
         if len(self.provider_priority) > 1:
-            logger.info(f"✓ AI provider chain: {' -> '.join(self.provider_priority)}")
+            logger.debug(f"AI provider chain: {' -> '.join(self.provider_priority)}")
         implicit_failover = [p for p in self.provider_priority if p not in self.ai_providers]
         if implicit_failover:
-            logger.info(f"  (implicit failover: {', '.join(implicit_failover)})")
+            logger.debug(f"  (implicit failover: {', '.join(implicit_failover)})")
 
         # Check for Poppler availability
         self._check_poppler()
@@ -215,7 +215,7 @@ class StructuredDocumentProcessor:
             import subprocess
 
             result = subprocess.run(["pdftoppm", "-v"], capture_output=True, text=True)
-            logger.info("✓ Poppler is installed and available for PDF processing")
+            logger.debug("Poppler is installed and available for PDF processing")
             return True
         except FileNotFoundError:
             logger.warning("⚠️  Poppler NOT found - PDF uploads will fail!")
@@ -245,7 +245,7 @@ class StructuredDocumentProcessor:
         try:
             cached = self.cache.get(cache_key)
             if cached:
-                logger.info(f"✓ Cache HIT: {cache_key[:30]}...")
+                logger.debug(f"Cache HIT: {cache_key[:30]}...")
                 return json.loads(cached)
         except Exception as e:
             logger.warning(f"Cache read error: {e}")
@@ -293,7 +293,7 @@ class StructuredDocumentProcessor:
                     logger.warning(
                         f"⚠️  AI call failed (attempt {attempt + 1}/{self.max_retries}): {e}"
                     )
-                    logger.info(f"   Retrying in {wait_time}s...")
+                    logger.debug(f"   Retrying in {wait_time}s...")
                     time.sleep(wait_time)
                 else:
                     logger.error(
@@ -395,7 +395,7 @@ class StructuredDocumentProcessor:
             # Wait before retry rounds (lets rate-limited keys recover)
             if round_num > 0:
                 delay = ROUND_DELAY_SECONDS[min(round_num, len(ROUND_DELAY_SECONDS) - 1)]
-                logger.info(
+                logger.debug(
                     f"Round {round_num + 1}/{MAX_ROUNDS}: waiting {delay}s for keys to recover..."
                 )
                 time.sleep(delay)
@@ -421,13 +421,13 @@ class StructuredDocumentProcessor:
                         result = method(*args, **kwargs)
                         self.key_pool.report_success(key_state)
                         if round_num > 0:
-                            logger.info(
-                                f"✓ AI call success on round {round_num + 1}: "
+                            logger.debug(
+                                f"AI call success on round {round_num + 1}: "
                                 f"{provider} key {key_state.key_suffix} (type: {extraction_type})"
                             )
                         else:
-                            logger.info(
-                                f"✓ AI call success: {provider} key {key_state.key_suffix} "
+                            logger.debug(
+                                f"AI call success: {provider} key {key_state.key_suffix} "
                                 f"(type: {extraction_type})"
                             )
                         return result
@@ -440,18 +440,23 @@ class StructuredDocumentProcessor:
                             )
                             break  # Same error with any key — skip provider
 
-                        # JSON parse errors = model output truncation, not a key issue.
-                        # Don't penalize the key — the API call succeeded, output was just too long.
+                        # Don't penalize keys for transient issues:
+                        # - JSON truncation = model output too long, not key's fault
+                        # - Timeouts = slow response, not key's fault
+                        # Only penalize for rate limits and actual API errors
                         is_json_error = isinstance(e, (json.JSONDecodeError, ValueError)) and "json" in str(type(e)).lower()
-                        if not is_json_error:
+                        is_timeout = "timeout" in str(e).lower() or "timed out" in str(e).lower()
+                        is_transient = is_json_error or is_timeout
+
+                        if not is_transient:
                             is_rate_limit = self._is_rate_limit_error(e)
                             self.key_pool.report_error(key_state, is_rate_limit=is_rate_limit)
                         else:
                             is_rate_limit = False
 
+                        error_type = "json-truncated" if is_json_error else "timeout" if is_timeout else "rate-limited" if is_rate_limit else type(e).__name__
                         logger.warning(
-                            f"AI call failed: {provider} key {key_state.key_suffix} "
-                            f"({'json-truncated' if is_json_error else 'rate-limited' if is_rate_limit else type(e).__name__}): {e}"
+                            f"AI call failed: {provider} key {key_state.key_suffix} ({error_type}): {e}"
                         )
 
                 if tried_keys == 0 and round_num == 0:
@@ -461,7 +466,7 @@ class StructuredDocumentProcessor:
             if round_num < MAX_ROUNDS - 1:
                 available = self.key_pool.get_all_providers()
                 if not available:
-                    logger.info(
+                    logger.debug(
                         f"All keys exhausted after round {round_num + 1}, "
                         f"waiting for recovery before round {round_num + 2}..."
                     )
@@ -560,7 +565,7 @@ class StructuredDocumentProcessor:
 
     def _process_image(self, image_path: Path) -> dict:
         """Process a single image file"""
-        logger.info(f"📄 Processing image: {image_path.name}")
+        logger.debug(f"Processing image: {image_path.name}")
 
         try:
             with open(image_path, "rb") as f:
@@ -570,9 +575,9 @@ class StructuredDocumentProcessor:
             if ext == "jpg":
                 ext = "jpeg"
 
-            logger.info(f"🤖 Calling AI ({self.ai_provider}) for data extraction...")
+            logger.debug(f"Calling AI ({self.ai_provider}) for data extraction...")
             structured_data = self._extract_structured_data(image_data, ext)
-            logger.info(f"✅ Image processing successful: {image_path.name}")
+            logger.debug(f"Image processing successful: {image_path.name}")
 
             return {
                 "file_name": image_path.name,
@@ -602,7 +607,7 @@ class StructuredDocumentProcessor:
 
         Supported models: GPT-4o, GPT-4o-mini, GPT-5, o1
         """
-        logger.info(f"📄 Processing PDF natively (no image conversion): {pdf_path.name}")
+        logger.debug(f"Processing PDF natively (no image conversion): {pdf_path.name}")
 
         try:
             # Read PDF file and encode as base64
@@ -611,14 +616,14 @@ class StructuredDocumentProcessor:
 
             # Get file size for logging
             file_size_mb = len(pdf_data) * 3/4 / (1024 * 1024)  # base64 is ~4/3 of original size
-            logger.info(f"📊 PDF size: {file_size_mb:.2f} MB")
+            logger.debug(f"PDF size: {file_size_mb:.2f} MB")
 
             if file_size_mb > 20:
-                logger.warning(f"⚠️ PDF is {file_size_mb:.2f} MB (>20MB recommended limit)")
+                logger.warning(f"PDF is {file_size_mb:.2f} MB (>20MB recommended limit)")
 
-            logger.info(f"🤖 Calling AI ({self.ai_provider}) for native PDF extraction...")
+            logger.debug(f"Calling AI ({self.ai_provider}) for native PDF extraction...")
             structured_data = self._extract_structured_data_from_pdf(pdf_data)
-            logger.info(f"✅ Native PDF processing successful: {pdf_path.name}")
+            logger.debug(f"Native PDF processing successful: {pdf_path.name}")
 
             return {
                 "file_name": pdf_path.name,
@@ -638,7 +643,7 @@ class StructuredDocumentProcessor:
         Process PDF - tries native PDF support first for supported models,
         falls back to Poppler image conversion if native fails or model doesn't support PDFs
         """
-        logger.info(f"📑 Processing PDF: {pdf_path.name}")
+        logger.debug(f"Processing PDF: {pdf_path.name}")
 
         # Try native PDF processing first - supported by GPT-4o, GPT-4o-mini, GPT-5, o1+ models
         # Only fine-tuned models don't support native PDF input
@@ -647,38 +652,38 @@ class StructuredDocumentProcessor:
             supports_native_pdf = not any(tag in model_lower for tag in ["fine_tuned", "ft:"])
             if supports_native_pdf:
                 try:
-                    logger.info("📄 Attempting native PDF processing (no Poppler needed)...")
+                    logger.debug("Attempting native PDF processing (no Poppler needed)...")
                     return self._process_pdf_native(pdf_path)
                 except Exception as e:
-                    logger.warning(f"⚠️ Native PDF failed: {e}")
-                    logger.info("🔄 Falling back to Poppler image conversion...")
+                    logger.warning(f"Native PDF failed: {e}")
+                    logger.debug("Falling back to Poppler image conversion...")
             else:
-                logger.info(f"📄 Model {self.openai_model} does not support native PDF - using image conversion")
+                logger.debug(f"Model {self.openai_model} does not support native PDF - using image conversion")
 
         # Fallback: Convert to images (original method)
         try:
             # On Windows, pdf2image needs explicit poppler_path
             poppler_path = os.getenv("POPPLER_PATH", None)
 
-            logger.info("🔄 Converting PDF to images using Poppler...")
+            logger.debug("Converting PDF to images using Poppler...")
             if poppler_path:
-                logger.info(f"   Using Poppler path from env: {poppler_path}")
+                logger.debug(f"   Using Poppler path from env: {poppler_path}")
                 images = convert_from_path(str(pdf_path), poppler_path=poppler_path)
             else:
-                logger.info("   Using Poppler from PATH")
+                logger.debug("   Using Poppler from PATH")
                 images = convert_from_path(str(pdf_path))
-            logger.info(f"✓ PDF converted successfully: {len(images)} page(s)")
+            logger.debug(f"PDF converted successfully: {len(images)} page(s)")
 
             # For multi-page PDFs, we'll process all pages and combine
             # For now, let's focus on single page or first page
             if len(images) > 1:
-                logger.info(f"📚 Multi-page PDF detected ({len(images)} pages)")
-                logger.info(f"🔄 Processing all pages...")
+                logger.debug(f"Multi-page PDF detected ({len(images)} pages)")
+                logger.debug(f"Processing all pages...")
 
             all_structured_data = []
 
             for i, image in enumerate(images):
-                logger.info(f"  📄 Processing page {i+1}/{len(images)}")
+                logger.debug(f"  Processing page {i+1}/{len(images)}")
 
                 # Resize image if too large (OpenAI has limits)
                 max_dimension = 2000
@@ -686,7 +691,7 @@ class StructuredDocumentProcessor:
                     ratio = min(max_dimension / image.width, max_dimension / image.height)
                     new_size = (int(image.width * ratio), int(image.height * ratio))
                     image = image.resize(new_size, Image.Resampling.LANCZOS)
-                    logger.info(f"  📐 Resized image to {new_size[0]}x{new_size[1]}")
+                    logger.debug(f"  Resized image to {new_size[0]}x{new_size[1]}")
 
                 # Encode image directly in memory (no temp files = no race conditions)
                 img_buffer = io.BytesIO()
@@ -694,18 +699,18 @@ class StructuredDocumentProcessor:
                 img_buffer.seek(0)
                 image_data = base64.b64encode(img_buffer.read()).decode("utf-8")
 
-                logger.info(f"  🤖 Calling AI ({self.ai_provider}) for page {i+1}...")
+                logger.debug(f"  Calling AI ({self.ai_provider}) for page {i+1}...")
                 page_data = self._extract_structured_data(
                     image_data, "png", page_num=i + 1
                 )
                 all_structured_data.append(page_data)
-                logger.info(f"  ✅ Page {i+1} processed successfully")
+                logger.debug(f"  Page {i+1} processed successfully")
 
             # For single page, return the data directly
             # For multi-page, return the first page's data (can be enhanced later)
             extracted_data = all_structured_data[0] if all_structured_data else None
 
-            logger.info(f"✅ PDF processing successful (image conversion): {pdf_path.name}")
+            logger.debug(f"PDF processing successful (image conversion): {pdf_path.name}")
             return {
                 "file_name": pdf_path.name,
                 "file_type": "pdf",
@@ -720,7 +725,7 @@ class StructuredDocumentProcessor:
             logger.warning(
                 f"⚠️ Poppler image conversion failed for {pdf_path.name}: {type(e).__name__}: {str(e)}"
             )
-            logger.info("🔄 Falling back to text extraction (pypdf)...")
+            logger.debug("Falling back to text extraction (pypdf)...")
 
         # Third fallback: Extract text from PDF using pypdf and send as text
         try:
@@ -735,14 +740,14 @@ class StructuredDocumentProcessor:
 
             if text_parts:
                 full_text = "\n\n".join(text_parts)
-                logger.info(f"📝 Extracted {len(full_text)} chars of text from PDF ({len(reader.pages)} pages)")
-                logger.info(f"🤖 Calling AI for text-based PDF extraction...")
+                logger.debug(f"Extracted {len(full_text)} chars of text from PDF ({len(reader.pages)} pages)")
+                logger.debug(f"Calling AI for text-based PDF extraction...")
 
                 structured_data = self._extract_structured_data_from_excel(
                     f"Documento PDF: {pdf_path.name}\n\n{full_text}"
                 )
 
-                logger.info(f"✅ PDF processed via text extraction: {pdf_path.name}")
+                logger.debug(f"PDF processed via text extraction: {pdf_path.name}")
                 return {
                     "file_name": pdf_path.name,
                     "file_type": "pdf",
@@ -766,16 +771,16 @@ class StructuredDocumentProcessor:
 
     def _process_excel(self, excel_path: Path) -> dict:
         """Process Excel file (XLSX/XLS) — always sends through AI first"""
-        logger.info(f"📊 Processing Excel file: {excel_path.name}")
+        logger.debug(f"Processing Excel file: {excel_path.name}")
 
         try:
             import pandas as pd
 
             # Read all sheets
-            logger.info("🔄 Reading Excel file...")
+            logger.debug("Reading Excel file...")
             excel_file = pd.ExcelFile(excel_path)
             sheet_names = excel_file.sheet_names
-            logger.info(f"✓ Found {len(sheet_names)} sheet(s): {sheet_names}")
+            logger.debug(f"Found {len(sheet_names)} sheet(s): {sheet_names}")
 
             # Read ALL sheets and combine into one text for AI
             all_dfs = []
@@ -797,7 +802,7 @@ class StructuredDocumentProcessor:
             CHUNK_THRESHOLD = 50  # rows above which we chunk (Nova's output limit is the bottleneck)
 
             # PRIMARY PATH: AI extraction (the whole point of the system)
-            logger.info(f"🤖 Sending Excel to AI ({self.ai_provider}) for extraction... ({total_rows} total rows)")
+            logger.debug(f"Sending Excel to AI ({self.ai_provider}) for extraction... ({total_rows} total rows)")
             try:
                 if total_rows <= CHUNK_THRESHOLD:
                     # Small file — send everything in one shot
@@ -805,7 +810,7 @@ class StructuredDocumentProcessor:
                     structured_data = self._extract_structured_data_from_excel(excel_text)
                 else:
                     # Large file — process in chunks and merge results
-                    logger.info(f"📊 Large Excel ({total_rows} rows) — chunking into ~{CHUNK_THRESHOLD}-row batches")
+                    logger.debug(f"Large Excel ({total_rows} rows) -- chunking into ~{CHUNK_THRESHOLD}-row batches")
                     structured_data = self._process_excel_chunked(all_dfs, excel_path.name)
 
                 # Validate AI result has usable data
@@ -819,7 +824,7 @@ class StructuredDocumentProcessor:
                     ai_success = has_txns or has_items or has_total
 
                 if ai_success:
-                    logger.info(f"✅ AI extraction successful for {excel_path.name}")
+                    logger.debug(f"AI extraction successful for {excel_path.name}")
 
                     # Override transaction types from filename/column context
                     # AI may not correctly detect income vs expense from Excel headers
@@ -846,7 +851,7 @@ class StructuredDocumentProcessor:
                     if detected_type and isinstance(structured_data, FinancialDocument):
                         # Override document-level type
                         if structured_data.transaction_type != detected_type:
-                            logger.info(f"📋 Overriding AI transaction_type '{structured_data.transaction_type}' → '{detected_type}' from context")
+                            logger.debug(f"Overriding AI transaction_type '{structured_data.transaction_type}' -> '{detected_type}' from context")
                             structured_data.transaction_type = detected_type
                         # Override transaction-level types if they all have the wrong type
                         if structured_data.transactions:
@@ -857,7 +862,7 @@ class StructuredDocumentProcessor:
                     # Override document_type: Excel spreadsheets with multiple rows → transaction_ledger
                     if isinstance(structured_data, FinancialDocument) and structured_data.document_type == "statement":
                         if structured_data.transactions and len(structured_data.transactions) > 1:
-                            logger.info(f"📋 Overriding document_type 'statement' → 'transaction_ledger' for Excel with {len(structured_data.transactions)} rows")
+                            logger.debug(f"Overriding document_type 'statement' -> 'transaction_ledger' for Excel with {len(structured_data.transactions)} rows")
                             structured_data.document_type = "transaction_ledger"
 
                     return {
@@ -878,7 +883,7 @@ class StructuredDocumentProcessor:
             is_ledger = self._is_transaction_ledger(primary_df)
 
             if is_ledger:
-                logger.info(f"📋 Fallback: pandas ledger parsing")
+                logger.debug(f"Fallback: pandas ledger parsing")
                 structured_data = self._process_excel_as_ledger(primary_df, excel_path)
 
                 # AI categorization for uncategorized transactions
@@ -908,11 +913,11 @@ class StructuredDocumentProcessor:
                         "error": "Não foi possível extrair dados do arquivo Excel",
                     }
             else:
-                logger.info(f"📄 Fallback: single document AI extraction")
+                logger.debug(f"Fallback: single document AI extraction")
                 excel_text_single = self._dataframe_to_text(primary_df, excel_path.name)
                 structured_data = self._extract_structured_data_from_excel(excel_text_single)
 
-            logger.info(f"✅ Excel processing successful (fallback): {excel_path.name}")
+            logger.debug(f"Excel processing successful (fallback): {excel_path.name}")
 
             return {
                 "file_name": excel_path.name,
@@ -995,33 +1000,48 @@ class StructuredDocumentProcessor:
         from models import TransactionLedger, Transaction, DateRangeSummary
 
         # Chunk sizes per provider based on output token limits
-        # Gemini flash-lite: ~8k output tokens → 100 rows safe
-        # Nova 2 Lite: ~5k output tokens → 50 rows safe
-        # OpenAI: ~16k output tokens → 150 rows safe
-        CHUNK_SIZES = {"gemini": 100, "nova": 50, "openai": 150}
+        # Nova excluded from chunking — its output cap is too low for spreadsheet JSON,
+        # causing constant truncation. Nova is still used for images/PDFs/small docs.
+        CHUNK_SIZES = {"gemini": 100, "openai": 100}
+        EXCLUDED_FROM_CHUNKS = {"nova"}  # providers that can't handle spreadsheet output
         DEFAULT_CHUNK_SIZE = 100
 
-        available_providers = [p for p in self.provider_priority if self.key_pool.has_provider(p)]
-        # Total keys across all providers = max safe concurrency
-        total_keys = sum(len(list(self.key_pool._pools.get(p, []))) for p in available_providers)
-        max_workers = max(total_keys, len(available_providers), 1)
+        # Only use providers that can handle spreadsheet-sized JSON output
+        chunk_providers = [p for p in self.provider_priority
+                          if self.key_pool.has_provider(p) and p not in EXCLUDED_FROM_CHUNKS]
 
-        # Build all chunks — each provider gets its own chunk size
+        if not chunk_providers:
+            # Fallback: use everything if somehow all are excluded
+            chunk_providers = [p for p in self.provider_priority if self.key_pool.has_provider(p)]
+
+        total_keys = sum(len(list(self.key_pool._pools.get(p, []))) for p in chunk_providers)
+        max_workers = max(total_keys, len(chunk_providers), 1)
+
+        # Build weighted provider rotation based on chunk sizes
+        max_chunk = max(CHUNK_SIZES.get(p, DEFAULT_CHUNK_SIZE) for p in chunk_providers)
+        weighted_providers = []
+        for p in chunk_providers:
+            weight = max(1, round(max_chunk / CHUNK_SIZES.get(p, DEFAULT_CHUNK_SIZE)))
+            weighted_providers.extend([p] * weight)
+        # e.g. gemini=100, nova=50, openai=100 → [gemini, nova, nova, openai]
+
+        logger.debug(f"  Provider rotation: {' -> '.join(weighted_providers)} (weighted by chunk size)")
+
+        # Build all chunks
         chunks = []
         chunk_index = 0
-        # Flatten all rows across sheets into one sequence, then assign to providers
-        all_sheet_rows = []  # [(sheet_name, df, start_row, end_row)]
+        all_sheet_rows = []
         for sheet_name, df in all_dfs:
             total_rows = len(df)
             if total_rows > 0:
                 all_sheet_rows.append((sheet_name, df, total_rows))
 
-        # Walk through rows, assigning chunks to providers round-robin
+        # Walk through rows, assigning chunks to providers via weighted rotation
         provider_idx = 0
         for sheet_name, df, total_rows in all_sheet_rows:
             row_pos = 0
             while row_pos < total_rows:
-                provider = available_providers[provider_idx % len(available_providers)] if available_providers else self.ai_provider
+                provider = weighted_providers[provider_idx % len(weighted_providers)] if weighted_providers else self.ai_provider
                 chunk_size = CHUNK_SIZES.get(provider, DEFAULT_CHUNK_SIZE)
 
                 chunk_df = df.iloc[row_pos:row_pos + chunk_size]
@@ -1040,7 +1060,7 @@ class StructuredDocumentProcessor:
                 row_pos += chunk_size
                 provider_idx += 1
 
-        logger.info(f"  Prepared {len(chunks)} chunks, processing with {max_workers} concurrent workers")
+        logger.debug(f"  Prepared {len(chunks)} chunks, processing with {max_workers} concurrent workers")
 
         # Build the dedicated chunk prompt once (much shorter than the general prompt)
         chunk_prompt = self._get_excel_chunk_prompt()
@@ -1048,7 +1068,7 @@ class StructuredDocumentProcessor:
         # Process chunk — runs in thread pool
         def process_chunk(chunk_info):
             idx, sheet, chunk_text, provider, row_start, row_end, total = chunk_info
-            logger.info(f"  Chunk {idx}: sheet '{sheet}' rows {row_start}-{row_end} of {total} (provider: {provider})")
+            logger.debug(f"  Chunk {idx}: sheet '{sheet}' rows {row_start}-{row_end} of {total} (provider: {provider})")
 
             # Set thread-local provider so _call_with_failover starts with it
             original = self.ai_provider
@@ -1116,7 +1136,7 @@ class StructuredDocumentProcessor:
             date_range=date_range,
         )
 
-        logger.info(
+        logger.debug(
             f"Chunked extraction complete: {len(all_transactions)} transactions "
             f"from {chunk_index} chunks (income={total_income}, expense={total_expense})"
         )
@@ -1157,7 +1177,7 @@ class StructuredDocumentProcessor:
         keyword_matches = sum(1 for kw in ledger_keywords if kw in column_str)
 
         if keyword_matches >= 2:
-            logger.info(f"📋 Ledger detection: {keyword_matches} keywords in column names")
+            logger.debug(f"Ledger detection: {keyword_matches} keywords in column names")
             return True
 
         # Strategy 2: Scan first 15 rows for a header row (real header may not be row 0)
@@ -1167,14 +1187,14 @@ class StructuredDocumentProcessor:
             row_str = " ".join(str(val).lower() for val in row if pd.notna(val))
             row_matches = sum(1 for kw in ledger_keywords if kw in row_str)
             if row_matches >= 2:
-                logger.info(f"📋 Ledger detection: {row_matches} keywords in row {i}")
+                logger.debug(f"Ledger detection: {row_matches} keywords in row {i}")
                 return True
 
         # Strategy 3: Structural heuristics - many rows + numeric column = ledger
         numeric_cols = df.select_dtypes(include=["float64", "int64"]).columns
         if len(numeric_cols) >= 1 and len(df_clean) > 20:
-            logger.info(
-                f"📋 Ledger detection: {len(numeric_cols)} numeric cols, {len(df_clean)} rows"
+            logger.debug(
+                f"Ledger detection: {len(numeric_cols)} numeric cols, {len(df_clean)} rows"
             )
             return True
 
@@ -1186,7 +1206,7 @@ class StructuredDocumentProcessor:
             monetary_pattern = re.compile(r'^-?\d{1,3}(\.\d{3})*(,\d{2})?$|^-?R?\$?\s?\d')
             monetary_count = sum(1 for val in sample if monetary_pattern.match(val.strip()))
             if monetary_count >= 3 and len(df_clean) >= 5:
-                logger.info(f"📋 Ledger detection: {monetary_count} monetary values in column '{col}'")
+                logger.debug(f"Ledger detection: {monetary_count} monetary values in column '{col}'")
                 return True
 
         return False
@@ -1276,7 +1296,7 @@ class StructuredDocumentProcessor:
 
         if pandas_keyword_hits >= 2 and auto_generated < len(df.columns) * 0.5:
             # Pandas detected headers correctly, no need to re-read
-            logger.info(f"📋 Pandas auto-detected header with {pandas_keyword_hits} keywords")
+            logger.debug(f"Pandas auto-detected header with {pandas_keyword_hits} keywords")
         else:
             # Strategy 2: Scan rows 0-20 for the real header row
             for i in range(min(20, len(df))):
@@ -1296,11 +1316,11 @@ class StructuredDocumentProcessor:
                 # Accept header if: has keywords, OR has many text cells that aren't data
                 if keyword_matches >= 2:
                     header_row = i
-                    logger.info(f"📋 Detected header row at index {i} ({keyword_matches} keyword matches)")
+                    logger.debug(f"Detected header row at index {i} ({keyword_matches} keyword matches)")
                     break
                 elif keyword_matches >= 1 and text_count >= 2:
                     header_row = i
-                    logger.info(f"📋 Detected header row at index {i} ({keyword_matches} keywords + {text_count} text cells)")
+                    logger.debug(f"Detected header row at index {i} ({keyword_matches} keywords + {text_count} text cells)")
                     break
 
         # Re-read with correct header
@@ -1325,7 +1345,7 @@ class StructuredDocumentProcessor:
             df_clean.columns = cleaned_columns
             df_clean = df_clean.reset_index(drop=True)
             df_clean = self._clean_dataframe(df_clean)
-            logger.info(f"✓ Re-read Excel with header row {header_row}, columns: {list(df_clean.columns)[:5]}")
+            logger.debug(f"Re-read Excel with header row {header_row}, columns: {list(df_clean.columns)[:5]}")
         else:
             df_clean = self._clean_dataframe(df_clean)
 
@@ -1398,7 +1418,7 @@ class StructuredDocumentProcessor:
                 elif any(kw in col_lower for kw in ["crédito", "credito", "credit"]):
                     credit_col = col
             if debit_col and credit_col:
-                logger.info(f"📋 Detected debit/credit dual columns: {debit_col} / {credit_col}")
+                logger.debug(f"Detected debit/credit dual columns: {debit_col} / {credit_col}")
                 # We'll handle this in the row loop below
 
         # Fallback: pick numeric column with most non-null values (skip mostly-NaN cols)
@@ -1425,7 +1445,7 @@ class StructuredDocumentProcessor:
                 hits = sum(1 for v in sample if monetary_re.match(v.strip()))
                 if hits >= 3:
                     amount_col = col
-                    logger.info(f"📋 Detected string-format monetary column: '{col}' ({hits}/10 samples match)")
+                    logger.debug(f"Detected string-format monetary column: '{col}' ({hits}/10 samples match)")
                     break
 
         # --- Category column: broader keywords ---
@@ -1499,10 +1519,10 @@ class StructuredDocumentProcessor:
                 force_type = "despesa"
 
         if force_type:
-            logger.info(f"📋 Transaction type from context: {force_type}")
+            logger.debug(f"Transaction type from context: {force_type}")
 
-        logger.info(
-            f"📋 Detected columns - Date: {date_col}, Desc: {description_col}, "
+        logger.debug(
+            f"Detected columns - Date: {date_col}, Desc: {description_col}, "
             f"Amount: {amount_col}, Debit: {debit_col}, Credit: {credit_col}, "
             f"Category: {category_col}, Counterparty: {counterparty_col}"
         )
@@ -1512,16 +1532,16 @@ class StructuredDocumentProcessor:
 
         # If we're missing critical columns, use AI to detect them
         if not date_col or not has_amount:
-            logger.info("🤖 Using AI to detect missing columns...")
+            logger.debug("Using AI to detect missing columns...")
             try:
                 ai_detected_cols = self._ai_detect_columns(df_clean)
                 if not date_col and ai_detected_cols.get('date'):
                     date_col = ai_detected_cols['date']
-                    logger.info(f"✓ AI detected date column: {date_col}")
+                    logger.debug(f"AI detected date column: {date_col}")
                 if not has_amount and ai_detected_cols.get('amount'):
                     amount_col = ai_detected_cols['amount']
                     has_amount = True
-                    logger.info(f"✓ AI detected amount column: {amount_col}")
+                    logger.debug(f"AI detected amount column: {amount_col}")
                 if not description_col and ai_detected_cols.get('description'):
                     description_col = ai_detected_cols['description']
                 if not category_col and ai_detected_cols.get('category'):
@@ -1721,8 +1741,8 @@ class StructuredDocumentProcessor:
         # Diagnostic logging - always show skip reasons
         total_skipped = sum(skipped_reasons.values())
         if total_skipped > 0:
-            logger.info(
-                f"📊 Row parsing stats: {len(transactions)} parsed, {total_skipped} skipped "
+            logger.debug(
+                f"Row parsing stats: {len(transactions)} parsed, {total_skipped} skipped "
                 f"(no_amount_col={skipped_reasons['no_amount_col']}, "
                 f"parse_fail={skipped_reasons['amount_parse_fail']}, "
                 f"zero={skipped_reasons['amount_zero']}, "
@@ -1803,8 +1823,8 @@ class StructuredDocumentProcessor:
             transactions=transactions,
         )
 
-        logger.info(
-            f"✅ Ledger summary - Income: {total_income}, Expense: {total_expense}, Balance: {total_income - total_expense}"
+        logger.debug(
+            f"Ledger summary - Income: {total_income}, Expense: {total_expense}, Balance: {total_income - total_expense}"
         )
 
         # Clean up dataframe references to release file handle
@@ -1831,7 +1851,7 @@ class StructuredDocumentProcessor:
         if not uncategorized_descriptions:
             return transactions
 
-        logger.info(f"🤖 AI categorizing {len(uncategorized_descriptions)} unique descriptions...")
+        logger.debug(f"AI categorizing {len(uncategorized_descriptions)} unique descriptions...")
 
         CATEGORIES_TEXT = (
             "RECEITA: receita_vendas_produtos, receita_servicos, receita_locacao, receita_comissoes, receita_contratos_recorrentes\n"
@@ -1902,7 +1922,7 @@ class StructuredDocumentProcessor:
 
                 batch_result = json.loads(raw)
                 description_to_category.update(batch_result)
-                logger.info(f"✓ AI categorized batch {batch_start // BATCH_SIZE + 1}: {len(batch_result)} items")
+                logger.debug(f"AI categorized batch {batch_start // BATCH_SIZE + 1}: {len(batch_result)} items")
 
             except Exception as e:
                 logger.warning(f"⚠️ AI categorization batch failed: {e}. Leaving as nao_categorizado.")
@@ -2663,7 +2683,7 @@ Important rules for Brazilian documents:
         - CTe (Conhecimento de Transporte) - Transport document
         - Generic XML with AI fallback
         """
-        logger.info(f"📄 Processing XML: {xml_path.name}")
+        logger.debug(f"Processing XML: {xml_path.name}")
 
         if not XML_AVAILABLE:
             return {
@@ -2685,22 +2705,22 @@ Important rules for Brazilian documents:
 
             # Try NFe (Nota Fiscal Eletrônica)
             if "nfeProc" in xml_dict or "NFe" in xml_dict:
-                logger.info("Detected NFe (Nota Fiscal Eletrônica)")
+                logger.debug("Detected NFe (Nota Fiscal Eletronica)")
                 extracted_data = self._extract_nfe(xml_dict)
 
             # Try NFSe (Nota Fiscal de Serviço)
             elif "CompNfse" in xml_dict or "NFSe" in xml_dict:
-                logger.info("Detected NFSe (Nota Fiscal de Serviço)")
+                logger.debug("Detected NFSe (Nota Fiscal de Servico)")
                 extracted_data = self._extract_nfse(xml_dict)
 
             # Try CTe (Conhecimento de Transporte)
             elif "cteProc" in xml_dict or "CTe" in xml_dict:
-                logger.info("Detected CTe (Conhecimento de Transporte)")
+                logger.debug("Detected CTe (Conhecimento de Transporte)")
                 extracted_data = self._extract_cte(xml_dict)
 
             # Item 4: Handle cancellation documents (extract cancellation data instead of rejecting)
             elif "procCancNFe" in xml_dict or "retCancNFe" in xml_dict:
-                logger.info("Detected NFe cancellation document - extracting cancellation data")
+                logger.debug("Detected NFe cancellation document - extracting cancellation data")
                 extracted_data = self._extract_nfe_cancellation(xml_dict)
 
             # Handle cancellation events (procEventoNFe with tpEvento=110111)
@@ -2709,7 +2729,7 @@ Important rules for Brazilian documents:
                 inf_evento = evento.get("infEvento", {})
                 tp_evento = inf_evento.get("tpEvento", "")
                 if tp_evento == "110111":  # Cancellation event
-                    logger.info("Detected NFe cancellation event - extracting cancellation data")
+                    logger.debug("Detected NFe cancellation event - extracting cancellation data")
                     extracted_data = self._extract_nfe_cancellation_event(xml_dict)
                 else:
                     logger.warning(f"Unknown NFe event type: {tp_evento}")
@@ -2786,24 +2806,24 @@ Important rules for Brazilian documents:
             if user_cnpj and clean_issuer == user_cnpj:
                 txn_type = "receita"
                 txn_category = "receita_vendas_produtos"
-                logger.info(f"📋 NFe: user is ISSUER (CNPJ match) → receita")
+                logger.debug(f"NFe: user is ISSUER (CNPJ match) -> receita")
             elif user_cnpj and clean_recipient == user_cnpj:
                 txn_type = "despesa"
                 txn_category = "compras_mercadorias"
-                logger.info(f"📋 NFe: user is RECIPIENT (CNPJ match) → despesa")
+                logger.debug(f"NFe: user is RECIPIENT (CNPJ match) -> despesa")
             elif user_name and user_name in (emit.get("xNome", "").lower()):
                 txn_type = "receita"
                 txn_category = "receita_vendas_produtos"
-                logger.info(f"📋 NFe: user is ISSUER (name match) → receita")
+                logger.debug(f"NFe: user is ISSUER (name match) -> receita")
             elif user_name and user_name in (dest.get("xNome", "").lower()):
                 txn_type = "despesa"
                 txn_category = "compras_mercadorias"
-                logger.info(f"📋 NFe: user is RECIPIENT (name match) → despesa")
+                logger.debug(f"NFe: user is RECIPIENT (name match) -> despesa")
             else:
                 # Default: assume user is issuer (they uploaded their own NFe)
                 txn_type = "receita"
                 txn_category = "receita_vendas_produtos"
-                logger.info(f"📋 NFe: no CNPJ match, defaulting to receita (issuer)")
+                logger.debug(f"NFe: no CNPJ match, defaulting to receita (issuer)")
 
             # Build FinancialDocument
             return FinancialDocument(
@@ -3180,7 +3200,7 @@ Use null for any column type you cannot identify."""
         Standard bank statement format used by Brazilian banks:
         Itaú, Bradesco, Banco do Brasil, Santander, Caixa, Nubank
         """
-        logger.info(f"📄 Processing OFX file: {ofx_path.name}")
+        logger.debug(f"Processing OFX file: {ofx_path.name}")
 
         try:
             from ofxparse import OfxParser
@@ -3229,7 +3249,7 @@ Use null for any column type you cannot identify."""
                 transactions=transactions,
             )
 
-            logger.info(f"✅ OFX processed: {len(transactions)} transactions")
+            logger.debug(f"OFX processed: {len(transactions)} transactions")
 
             return {
                 "file_name": ofx_path.name,
@@ -3262,7 +3282,7 @@ Use null for any column type you cannot identify."""
         Legacy SGML-based bank statement format, predecessor to OFX
         Some older Brazilian banking systems still export this format
         """
-        logger.info(f"📄 Processing OFC file: {ofc_path.name}")
+        logger.debug(f"Processing OFC file: {ofc_path.name}")
 
         try:
             import re
@@ -3344,7 +3364,7 @@ Use null for any column type you cannot identify."""
                 transactions=transactions,
             )
 
-            logger.info(f"✅ OFC processed: {len(transactions)} transactions")
+            logger.debug(f"OFC processed: {len(transactions)} transactions")
 
             return {
                 "file_name": ofc_path.name,
@@ -3367,7 +3387,7 @@ Use null for any column type you cannot identify."""
         Process Word documents (.doc, .docx)
         Extracts text content and sends to AI for financial data extraction
         """
-        logger.info(f"📄 Processing Word document: {docx_path.name}")
+        logger.debug(f"Processing Word document: {docx_path.name}")
 
         try:
             from docx import Document
@@ -3400,12 +3420,12 @@ Use null for any column type you cannot identify."""
                     "error": "Documento Word vazio ou sem texto extraível",
                 }
 
-            logger.info(f"🤖 Calling AI for Word document extraction ({len(full_text)} chars)...")
+            logger.debug(f"Calling AI for Word document extraction ({len(full_text)} chars)...")
             structured_data = self._extract_structured_data_from_excel(
                 f"Arquivo Word: {docx_path.name}\n\n{full_text}"
             )
 
-            logger.info(f"✅ Word document processed: {docx_path.name}")
+            logger.debug(f"Word document processed: {docx_path.name}")
 
             return {
                 "file_name": docx_path.name,
@@ -3437,7 +3457,7 @@ Use null for any column type you cannot identify."""
         Process plain text files (.txt)
         Sends text content to AI for financial data extraction
         """
-        logger.info(f"📄 Processing text file: {txt_path.name}")
+        logger.debug(f"Processing text file: {txt_path.name}")
 
         try:
             # Try multiple encodings common in Brazil
@@ -3466,12 +3486,12 @@ Use null for any column type you cannot identify."""
                     "error": "Arquivo de texto vazio",
                 }
 
-            logger.info(f"🤖 Calling AI for text file extraction ({len(text)} chars)...")
+            logger.debug(f"Calling AI for text file extraction ({len(text)} chars)...")
             structured_data = self._extract_structured_data_from_excel(
                 f"Arquivo Texto: {txt_path.name}\n\n{text}"
             )
 
-            logger.info(f"✅ Text file processed: {txt_path.name}")
+            logger.debug(f"Text file processed: {txt_path.name}")
 
             return {
                 "file_name": txt_path.name,

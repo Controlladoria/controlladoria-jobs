@@ -38,7 +38,7 @@ def retry_failed_documents():
     from database import SessionLocal, Document, DocumentStatus
 
     if not settings.document_retry_enabled:
-        logger.info("Document retry is disabled")
+        logger.debug("Document retry is disabled")
         return
 
     logger.info("Starting nightly retry of failed documents")
@@ -56,7 +56,7 @@ def retry_failed_documents():
         ).order_by(Document.upload_date.asc()).all()
 
         if not failed_docs:
-            logger.info("No failed documents to retry")
+            logger.debug("No failed documents to retry")
             return
 
         logger.info(f"Found {len(failed_docs)} failed documents eligible for retry")
@@ -98,7 +98,7 @@ def retry_failed_documents():
                     }),
                 )
                 retried += 1
-                logger.info(
+                logger.debug(
                     f"Retrying document {doc.id} ({doc.file_name}) - "
                     f"attempt {doc.retry_count}/{settings.document_max_retries}"
                 )

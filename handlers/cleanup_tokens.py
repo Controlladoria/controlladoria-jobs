@@ -31,7 +31,7 @@ def cleanup_expired_verification_tokens():
     """
     from database import SessionLocal, User
 
-    logger.info("Starting expired verification token cleanup")
+    logger.info("Starting verification token cleanup")
     db = SessionLocal()
 
     try:
@@ -53,7 +53,7 @@ def cleanup_expired_verification_tokens():
         if cleaned_count > 0:
             logger.info(f"Cleaned {cleaned_count} expired verification tokens")
         else:
-            logger.info("No expired verification tokens to clean")
+            logger.debug("No expired verification tokens to clean")
 
     except Exception as e:
         logger.error(f"Verification token cleanup failed: {e}")

@@ -88,9 +88,9 @@ def _download_from_s3(s3_key: str) -> str | None:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext, dir="/tmp")
         tmp.close()
 
-        logger.info(f"Downloading from bucket={settings.s3_bucket_name} key={s3_key}")
+        logger.debug(f"Downloading from bucket={settings.s3_bucket_name} key={s3_key}")
         s3.download_file(settings.s3_bucket_name, s3_key, tmp.name)
-        logger.info(f"Downloaded {s3_key} to {tmp.name}")
+        logger.debug(f"Downloaded {s3_key} to {tmp.name}")
         return tmp.name
     except Exception as e:
         logger.error(f"S3 download failed: bucket={settings.s3_bucket_name} key={s3_key} error={e}")

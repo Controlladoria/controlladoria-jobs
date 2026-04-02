@@ -36,7 +36,7 @@ def cleanup_old_files():
     from database import SessionLocal, Document
 
     if not settings.file_cleanup_enabled:
-        logger.info("File cleanup is disabled in settings")
+        logger.debug("File cleanup is disabled in settings")
         return
 
     logger.info("Starting scheduled file cleanup job")
@@ -44,7 +44,7 @@ def cleanup_old_files():
 
     try:
         cutoff_date = datetime.utcnow() - timedelta(days=settings.file_retention_days)
-        logger.info(
+        logger.debug(
             f"Deleting files older than {cutoff_date.date()} ({settings.file_retention_days} days)"
         )
 
@@ -60,7 +60,7 @@ def cleanup_old_files():
                         s3.s3_client.delete_object(
                             Bucket=s3.bucket_name, Key=doc.file_path
                         )
-                        logger.info(f"Deleted S3 object: {doc.file_path}")
+                        logger.debug(f"Deleted S3 object: {doc.file_path}")
                     except Exception as e:
                         logger.error(f"Error deleting S3 object {doc.file_path}: {e}")
 
