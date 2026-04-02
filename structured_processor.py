@@ -978,44 +978,35 @@ class StructuredDocumentProcessor:
     def _process_excel_chunked(self, all_dfs: list, filename: str):
         """
         Process a large Excel file by splitting into chunks, extracting each
-        chunk with AI, and merging the results into a single TransactionLedger.
+        chunk with AI IN PARALLEL, and merging the results into a single TransactionLedger.
 
-        This avoids blowing up AI context windows on 1000+ row spreadsheets
-        while still extracting every single row.
+        Chunks are distributed across providers (round-robin) and run concurrently
+        using ThreadPoolExecutor. With 3 providers, 3 chunks run at once.
         """
         import pandas as pd
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from models import TransactionLedger, Transaction, DateRangeSummary
 
-        CHUNK_SIZE = 150  # Flash-lite truncates JSON output at ~44k chars (~8k tokens). 150 rows keeps output safe.
-        all_transactions = []
-        chunk_index = 0
-
-        # Rotate primary provider per chunk to distribute load
-        # e.g. chunk 1 → gemini, chunk 2 → nova, chunk 3 → openai, chunk 4 → gemini...
+        CHUNK_SIZE = 150  # Flash-lite truncates JSON at ~8k output tokens. 150 rows stays safe.
         available_providers = [p for p in self.provider_priority if self.key_pool.has_provider(p)]
-        original_provider = self.ai_provider
+        # Total keys across all providers = max safe concurrency
+        # e.g. 2 gemini keys + 1 nova + 1 openai = 4 concurrent requests
+        total_keys = sum(len(list(self.key_pool._pools.get(p, []))) for p in available_providers)
+        max_workers = max(total_keys, len(available_providers), 1)
 
+        # Build all chunks first
+        chunks = []  # List of (chunk_index, sheet_name, chunk_text, provider)
+        chunk_index = 0
         for sheet_name, df in all_dfs:
             total_rows = len(df)
             if total_rows == 0:
                 continue
-
-            # Split sheet into chunks
             for start in range(0, total_rows, CHUNK_SIZE):
                 chunk_df = df.iloc[start:start + CHUNK_SIZE]
                 chunk_index += 1
                 end = min(start + CHUNK_SIZE, total_rows)
+                provider = available_providers[(chunk_index - 1) % len(available_providers)] if available_providers else self.ai_provider
 
-                # Round-robin: assign this chunk to a different primary provider
-                if available_providers:
-                    self.ai_provider = available_providers[(chunk_index - 1) % len(available_providers)]
-
-                logger.info(
-                    f"  Chunk {chunk_index}: sheet '{sheet_name}' rows {start+1}-{end} of {total_rows} "
-                    f"(provider: {self.ai_provider})"
-                )
-
-                # Build text for this chunk (include column headers for context)
                 text_parts = [
                     f"Arquivo Excel: {filename}\n",
                     f"ABA: {sheet_name} (linhas {start+1} a {end} de {total_rows})\n",
@@ -1023,26 +1014,44 @@ class StructuredDocumentProcessor:
                     "Dados:\n",
                     chunk_df.to_string(index=False),
                 ]
-                chunk_text = "\n".join(text_parts)
+                chunks.append((chunk_index, sheet_name, "\n".join(text_parts), provider, start + 1, end, total_rows))
 
-                try:
-                    result = self._extract_structured_data_from_excel(chunk_text)
+        logger.info(f"  Prepared {len(chunks)} chunks, processing with {max_workers} concurrent workers")
 
-                    # Collect transactions from the AI result
-                    if isinstance(result, FinancialDocument) and result.transactions:
-                        all_transactions.extend(result.transactions)
-                    elif hasattr(result, "transactions") and result.transactions:
-                        all_transactions.extend(result.transactions)
+        # Process chunk — runs in thread pool
+        def process_chunk(chunk_info):
+            idx, sheet, chunk_text, provider, row_start, row_end, total = chunk_info
+            logger.info(f"  Chunk {idx}: sheet '{sheet}' rows {row_start}-{row_end} of {total} (provider: {provider})")
 
-                    # Brief pause between chunks to spread rate limit pressure
-                    if chunk_index > 1:
-                        time.sleep(1)
-                except Exception as e:
-                    logger.warning(f"  Chunk {chunk_index} AI extraction failed: {e}")
-                    # Continue with remaining chunks — partial extraction is better than none
+            # Set thread-local provider so _call_with_failover starts with it
+            original = self.ai_provider
+            self.ai_provider = provider
+            try:
+                result = self._extract_structured_data_from_excel(chunk_text)
+                transactions = []
+                if isinstance(result, FinancialDocument) and result.transactions:
+                    transactions = list(result.transactions)
+                elif hasattr(result, "transactions") and result.transactions:
+                    transactions = list(result.transactions)
+                return idx, transactions, None
+            except Exception as e:
+                logger.warning(f"  Chunk {idx} failed: {e}")
+                return idx, [], e
+            finally:
+                self.ai_provider = original
 
-        # Restore original provider
-        self.ai_provider = original_provider
+        # Run chunks in parallel — max_workers threads at once
+        all_results = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_chunk, chunk): chunk[0] for chunk in chunks}
+            for future in as_completed(futures):
+                idx, transactions, error = future.result()
+                all_results[idx] = transactions
+
+        # Merge in original chunk order (important for row ordering)
+        all_transactions = []
+        for i in sorted(all_results.keys()):
+            all_transactions.extend(all_results[i])
 
         if not all_transactions:
             # All chunks failed — return empty FinancialDocument so caller hits pandas fallback
