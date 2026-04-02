@@ -440,11 +440,18 @@ class StructuredDocumentProcessor:
                             )
                             break  # Same error with any key — skip provider
 
-                        is_rate_limit = self._is_rate_limit_error(e)
-                        self.key_pool.report_error(key_state, is_rate_limit=is_rate_limit)
+                        # JSON parse errors = model output truncation, not a key issue.
+                        # Don't penalize the key — the API call succeeded, output was just too long.
+                        is_json_error = isinstance(e, (json.JSONDecodeError, ValueError)) and "json" in str(type(e)).lower()
+                        if not is_json_error:
+                            is_rate_limit = self._is_rate_limit_error(e)
+                            self.key_pool.report_error(key_state, is_rate_limit=is_rate_limit)
+                        else:
+                            is_rate_limit = False
+
                         logger.warning(
                             f"AI call failed: {provider} key {key_state.key_suffix} "
-                            f"({'rate-limited' if is_rate_limit else type(e).__name__}): {e}"
+                            f"({'json-truncated' if is_json_error else 'rate-limited' if is_rate_limit else type(e).__name__}): {e}"
                         )
 
                 if tried_keys == 0 and round_num == 0:
@@ -787,7 +794,7 @@ class StructuredDocumentProcessor:
 
             # Check total row count to decide chunking strategy
             total_rows = sum(len(df) for _, df in all_dfs)
-            CHUNK_THRESHOLD = 150  # rows above which we chunk (flash-lite output limit)
+            CHUNK_THRESHOLD = 100  # rows above which we chunk (Nova output token limit)
 
             # PRIMARY PATH: AI extraction (the whole point of the system)
             logger.info(f"🤖 Sending Excel to AI ({self.ai_provider}) for extraction... ({total_rows} total rows)")
@@ -987,7 +994,7 @@ class StructuredDocumentProcessor:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from models import TransactionLedger, Transaction, DateRangeSummary
 
-        CHUNK_SIZE = 150  # Flash-lite truncates JSON at ~8k output tokens. 150 rows stays safe.
+        CHUNK_SIZE = 100  # Nova 2 Lite caps at ~5k output tokens. 100 rows keeps all providers safe.
         available_providers = [p for p in self.provider_priority if self.key_pool.has_provider(p)]
         # Total keys across all providers = max safe concurrency
         # e.g. 2 gemini keys + 1 nova + 1 openai = 4 concurrent requests
@@ -1018,6 +1025,9 @@ class StructuredDocumentProcessor:
 
         logger.info(f"  Prepared {len(chunks)} chunks, processing with {max_workers} concurrent workers")
 
+        # Build the dedicated chunk prompt once (much shorter than the general prompt)
+        chunk_prompt = self._get_excel_chunk_prompt()
+
         # Process chunk — runs in thread pool
         def process_chunk(chunk_info):
             idx, sheet, chunk_text, provider, row_start, row_end, total = chunk_info
@@ -1026,6 +1036,8 @@ class StructuredDocumentProcessor:
             # Set thread-local provider so _call_with_failover starts with it
             original = self.ai_provider
             self.ai_provider = provider
+            # Use the short chunk prompt instead of the massive invoice prompt
+            self._thread_local._chunk_prompt = chunk_prompt
             try:
                 result = self._extract_structured_data_from_excel(chunk_text)
                 transactions = []
@@ -1039,6 +1051,7 @@ class StructuredDocumentProcessor:
                 return idx, [], e
             finally:
                 self.ai_provider = original
+                self._thread_local._chunk_prompt = None  # Clear so non-chunk calls use normal prompt
 
         # Run chunks in parallel — max_workers threads at once
         all_results = {}
@@ -1927,7 +1940,7 @@ class StructuredDocumentProcessor:
                 "messages": [
                     {
                         "role": "user",
-                        "content": f"{self._get_extraction_prompt(self.user_company_info)}\n\nDADOS DO EXCEL:\n{excel_text}",
+                        "content": f"{getattr(self._thread_local, '_chunk_prompt', None) or self._get_extraction_prompt(self.user_company_info)}\n\nDADOS DO EXCEL:\n{excel_text}",
                     }
                 ],
                 "max_completion_tokens": 16000,  # Higher limit for reasoning models (reasoning + output)
@@ -1967,6 +1980,52 @@ class StructuredDocumentProcessor:
     ) -> FinancialDocument:
         """Extract structured financial data using AI (with failover)"""
         return self._call_with_failover("image", image_base64, image_type)
+
+    def _get_excel_chunk_prompt(self) -> str:
+        """Dedicated prompt for Excel chunk extraction. Short, direct, no ambiguity.
+        Every row MUST become a transaction — no skipping, no summarizing."""
+        return """You are extracting financial transactions from a Brazilian Excel spreadsheet.
+
+CRITICAL RULES:
+1. EVERY ROW in the data = ONE transaction in the output. Do NOT skip ANY row.
+2. If the input has 150 rows of data, the output MUST have 150 transactions.
+3. Do NOT summarize, merge, or deduplicate rows. Extract each one individually.
+4. Do NOT skip rows that look like subtotals, totals, or duplicates — extract them too.
+
+Brazilian number format: "1.234,56" = 1234.56 (comma = decimal, period = thousands).
+Convert all amounts to standard format (period for decimal, no thousands separator).
+Dates: convert to YYYY-MM-DD (from dd/mm/yyyy).
+
+Return ONLY a valid JSON object (no markdown):
+{
+  "document_type": "transaction_ledger",
+  "transactions": [
+    {
+      "date": "YYYY-MM-DD",
+      "description": "EXACT text from the row, IN UPPERCASE",
+      "category": "one of the categories below",
+      "amount": "1234.56",
+      "transaction_type": "income|expense",
+      "counterparty": "supplier or client name if present in the data"
+    }
+  ]
+}
+
+For transaction_type: if the sheet name or column headers indicate "Recebimentos", "Receitas", "Faturamento" → "income". If "Pagamentos", "Despesas", "Compras" → "expense". If unclear, default to "expense".
+
+CATEGORY — MANDATORY for every transaction. Analyze the description and counterparty to pick the best match:
+  RECEITA: "receita_vendas_produtos", "receita_servicos", "receita_locacao", "receita_comissoes", "receita_contratos_recorrentes"
+  DEDUCOES: "impostos_sobre_vendas", "devolucoes", "descontos_concedidos"
+  CUSTOS VARIAVEIS: "cmv", "csp", "materia_prima", "insumos", "comissoes_sobre_vendas"
+  CUSTOS FIXOS: "salarios_producao", "encargos_sociais_producao", "energia_producao", "manutencao_equipamentos_producao"
+  DESPESAS ADMIN: "salarios_administrativos", "pro_labore", "encargos_sociais_administrativos", "aluguel", "condominio", "agua_energia", "material_escritorio", "honorarios_contabeis", "sistemas_softwares", "telefonia_internet"
+  DESPESAS COMERCIAIS: "marketing_publicidade", "propaganda_digital", "comissao_vendas", "fretes", "representantes_comerciais"
+  FINANCEIRO: "receita_financeira", "juros_ativos", "descontos_obtidos", "juros_passivos", "tarifas_bancarias", "iof", "multas_encargos"
+  TRIBUTOS: "irpj", "csll", "simples_nacional", "iptu", "taxas_municipais"
+  OUTRAS: "recuperacao_despesas", "venda_imobilizado", "indenizacoes_recebidas", "outras_receitas_eventuais", "perdas", "indenizacoes_pagas", "doacoes", "provisoes", "depreciacao", "amortizacao", "outras_despesas_operacionais"
+  "nao_categorizado" — ABSOLUTE LAST RESORT ONLY. Try HARD to match a real category first. Analyze the description, the counterparty name, the sheet name, everything. There is almost always a matching category.
+
+REMEMBER: Output MUST have the EXACT same number of transactions as rows in the input data."""
 
     def _get_extraction_prompt(self, user_company_info: dict = None) -> str:
         """Get the prompt for structured data extraction with user context"""
@@ -2386,7 +2445,7 @@ Important rules for Brazilian documents:
             return FinancialDocument(**cached)
 
         def _call_gemini():
-            prompt = f"{self._get_extraction_prompt(self.user_company_info)}\n\nDADOS DO EXCEL:\n{excel_text}"
+            prompt = f"{getattr(self._thread_local, '_chunk_prompt', None) or self._get_extraction_prompt(self.user_company_info)}\n\nDADOS DO EXCEL:\n{excel_text}"
 
             gemini_client = self._active_client
             response = gemini_client.models.generate_content(
@@ -2525,7 +2584,7 @@ Important rules for Brazilian documents:
             return FinancialDocument(**cached)
 
         def _call_nova():
-            prompt = f"{self._get_extraction_prompt(self.user_company_info)}\n\nDADOS DO EXCEL:\n{excel_text}"
+            prompt = f"{getattr(self._thread_local, '_chunk_prompt', None) or self._get_extraction_prompt(self.user_company_info)}\n\nDADOS DO EXCEL:\n{excel_text}"
 
             bedrock = self._active_client
             response = bedrock.converse(
