@@ -60,7 +60,7 @@ jobs:
           }'
 
           declare -A FUNCTIONS
-          FUNCTIONS[controlladoria-worker-document-processing-dev]="handlers.process_document.handler|512|900"
+          FUNCTIONS[controlladoria-worker-document-processing-dev]="handlers.process_document.handler|1024|900"
           FUNCTIONS[controlladoria-worker-cleanup-files-dev]="handlers.cleanup_files.handler|256|300"
           FUNCTIONS[controlladoria-worker-cleanup-tokens-dev]="handlers.cleanup_tokens.handler|256|60"
           FUNCTIONS[controlladoria-worker-retry-documents-dev]="handlers.retry_documents.handler|256|300"

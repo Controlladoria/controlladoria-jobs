@@ -385,7 +385,9 @@ class StructuredDocumentProcessor:
         MAX_ROUNDS = 3
         ROUND_DELAY_SECONDS = [0, 10, 30]  # wait before round 2, 3
 
-        providers_to_try = list(self.provider_priority) if self.ai_failover_enabled else list(self.ai_providers)
+        # Build provider list with current ai_provider first, then the rest
+        all_providers = list(self.provider_priority) if self.ai_failover_enabled else list(self.ai_providers)
+        providers_to_try = [self.ai_provider] + [p for p in all_providers if p != self.ai_provider]
 
         last_exception = None
 
@@ -785,7 +787,7 @@ class StructuredDocumentProcessor:
 
             # Check total row count to decide chunking strategy
             total_rows = sum(len(df) for _, df in all_dfs)
-            CHUNK_THRESHOLD = 500  # rows above which we chunk
+            CHUNK_THRESHOLD = 150  # rows above which we chunk (flash-lite output limit)
 
             # PRIMARY PATH: AI extraction (the whole point of the system)
             logger.info(f"🤖 Sending Excel to AI ({self.ai_provider}) for extraction... ({total_rows} total rows)")
@@ -984,7 +986,7 @@ class StructuredDocumentProcessor:
         import pandas as pd
         from models import TransactionLedger, Transaction, DateRangeSummary
 
-        CHUNK_SIZE = 300  # Balance between fewer API calls and staying within output token limits
+        CHUNK_SIZE = 150  # Flash-lite truncates JSON output at ~44k chars (~8k tokens). 150 rows keeps output safe.
         all_transactions = []
         chunk_index = 0
 
