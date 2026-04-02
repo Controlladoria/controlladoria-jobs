@@ -785,9 +785,9 @@ class StructuredDocumentProcessor:
 
             # Check total row count to decide chunking strategy
             total_rows = sum(len(df) for _, df in all_dfs)
-            CHUNK_THRESHOLD = 200  # rows above which we chunk to avoid blowing up AI context
+            CHUNK_THRESHOLD = 500  # rows above which we chunk
 
-            # PRIMARY PATH: Always send to AI for extraction
+            # PRIMARY PATH: AI extraction (the whole point of the system)
             logger.info(f"🤖 Sending Excel to AI ({self.ai_provider}) for extraction... ({total_rows} total rows)")
             try:
                 if total_rows <= CHUNK_THRESHOLD:
@@ -802,7 +802,6 @@ class StructuredDocumentProcessor:
                 # Validate AI result has usable data
                 ai_success = False
                 if isinstance(structured_data, TransactionLedger):
-                    # Chunked processing returns TransactionLedger directly
                     ai_success = structured_data.total_transactions > 0
                 elif isinstance(structured_data, FinancialDocument):
                     has_txns = structured_data.transactions and len(structured_data.transactions) > 0
@@ -858,10 +857,11 @@ class StructuredDocumentProcessor:
                         "status": "success",
                         "extracted_data": structured_data,
                     }
+
                 else:
-                    logger.warning(f"⚠️ AI returned empty/unusable result, trying pandas fallback...")
+                    logger.warning(f"AI returned empty/unusable result, trying pandas fallback...")
             except Exception as e:
-                logger.warning(f"⚠️ AI extraction failed ({e}), trying pandas fallback...")
+                logger.warning(f"AI extraction failed ({e}), trying pandas fallback...")
 
             # FALLBACK: Use pandas-based ledger parsing
             # Use the first sheet with the most rows for ledger detection
@@ -984,9 +984,14 @@ class StructuredDocumentProcessor:
         import pandas as pd
         from models import TransactionLedger, Transaction, DateRangeSummary
 
-        CHUNK_SIZE = 200
+        CHUNK_SIZE = 300  # Balance between fewer API calls and staying within output token limits
         all_transactions = []
         chunk_index = 0
+
+        # Rotate primary provider per chunk to distribute load
+        # e.g. chunk 1 → gemini, chunk 2 → nova, chunk 3 → openai, chunk 4 → gemini...
+        available_providers = [p for p in self.provider_priority if self.key_pool.has_provider(p)]
+        original_provider = self.ai_provider
 
         for sheet_name, df in all_dfs:
             total_rows = len(df)
@@ -998,8 +1003,14 @@ class StructuredDocumentProcessor:
                 chunk_df = df.iloc[start:start + CHUNK_SIZE]
                 chunk_index += 1
                 end = min(start + CHUNK_SIZE, total_rows)
+
+                # Round-robin: assign this chunk to a different primary provider
+                if available_providers:
+                    self.ai_provider = available_providers[(chunk_index - 1) % len(available_providers)]
+
                 logger.info(
-                    f"  Chunk {chunk_index}: sheet '{sheet_name}' rows {start+1}-{end} of {total_rows}"
+                    f"  Chunk {chunk_index}: sheet '{sheet_name}' rows {start+1}-{end} of {total_rows} "
+                    f"(provider: {self.ai_provider})"
                 )
 
                 # Build text for this chunk (include column headers for context)
@@ -1021,12 +1032,15 @@ class StructuredDocumentProcessor:
                     elif hasattr(result, "transactions") and result.transactions:
                         all_transactions.extend(result.transactions)
 
-                    # Brief pause between chunks to avoid rate limit storms
+                    # Brief pause between chunks to spread rate limit pressure
                     if chunk_index > 1:
-                        time.sleep(2)
+                        time.sleep(1)
                 except Exception as e:
                     logger.warning(f"  Chunk {chunk_index} AI extraction failed: {e}")
                     # Continue with remaining chunks — partial extraction is better than none
+
+        # Restore original provider
+        self.ai_provider = original_provider
 
         if not all_transactions:
             # All chunks failed — return empty FinancialDocument so caller hits pandas fallback
