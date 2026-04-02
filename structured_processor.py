@@ -794,7 +794,7 @@ class StructuredDocumentProcessor:
 
             # Check total row count to decide chunking strategy
             total_rows = sum(len(df) for _, df in all_dfs)
-            CHUNK_THRESHOLD = 100  # rows above which we chunk (Nova output token limit)
+            CHUNK_THRESHOLD = 50  # rows above which we chunk (Nova's output limit is the bottleneck)
 
             # PRIMARY PATH: AI extraction (the whole point of the system)
             logger.info(f"🤖 Sending Excel to AI ({self.ai_provider}) for extraction... ({total_rows} total rows)")
@@ -994,34 +994,51 @@ class StructuredDocumentProcessor:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from models import TransactionLedger, Transaction, DateRangeSummary
 
-        CHUNK_SIZE = 100  # Nova 2 Lite caps at ~5k output tokens. 100 rows keeps all providers safe.
+        # Chunk sizes per provider based on output token limits
+        # Gemini flash-lite: ~8k output tokens → 100 rows safe
+        # Nova 2 Lite: ~5k output tokens → 50 rows safe
+        # OpenAI: ~16k output tokens → 150 rows safe
+        CHUNK_SIZES = {"gemini": 100, "nova": 50, "openai": 150}
+        DEFAULT_CHUNK_SIZE = 100
+
         available_providers = [p for p in self.provider_priority if self.key_pool.has_provider(p)]
         # Total keys across all providers = max safe concurrency
-        # e.g. 2 gemini keys + 1 nova + 1 openai = 4 concurrent requests
         total_keys = sum(len(list(self.key_pool._pools.get(p, []))) for p in available_providers)
         max_workers = max(total_keys, len(available_providers), 1)
 
-        # Build all chunks first
-        chunks = []  # List of (chunk_index, sheet_name, chunk_text, provider)
+        # Build all chunks — each provider gets its own chunk size
+        chunks = []
         chunk_index = 0
+        # Flatten all rows across sheets into one sequence, then assign to providers
+        all_sheet_rows = []  # [(sheet_name, df, start_row, end_row)]
         for sheet_name, df in all_dfs:
             total_rows = len(df)
-            if total_rows == 0:
-                continue
-            for start in range(0, total_rows, CHUNK_SIZE):
-                chunk_df = df.iloc[start:start + CHUNK_SIZE]
+            if total_rows > 0:
+                all_sheet_rows.append((sheet_name, df, total_rows))
+
+        # Walk through rows, assigning chunks to providers round-robin
+        provider_idx = 0
+        for sheet_name, df, total_rows in all_sheet_rows:
+            row_pos = 0
+            while row_pos < total_rows:
+                provider = available_providers[provider_idx % len(available_providers)] if available_providers else self.ai_provider
+                chunk_size = CHUNK_SIZES.get(provider, DEFAULT_CHUNK_SIZE)
+
+                chunk_df = df.iloc[row_pos:row_pos + chunk_size]
                 chunk_index += 1
-                end = min(start + CHUNK_SIZE, total_rows)
-                provider = available_providers[(chunk_index - 1) % len(available_providers)] if available_providers else self.ai_provider
+                end = min(row_pos + chunk_size, total_rows)
 
                 text_parts = [
                     f"Arquivo Excel: {filename}\n",
-                    f"ABA: {sheet_name} (linhas {start+1} a {end} de {total_rows})\n",
+                    f"ABA: {sheet_name} (linhas {row_pos+1} a {end} de {total_rows})\n",
                     f"Colunas: {', '.join(df.columns.astype(str))}\n\n",
                     "Dados:\n",
                     chunk_df.to_string(index=False),
                 ]
-                chunks.append((chunk_index, sheet_name, "\n".join(text_parts), provider, start + 1, end, total_rows))
+                chunks.append((chunk_index, sheet_name, "\n".join(text_parts), provider, row_pos + 1, end, total_rows))
+
+                row_pos += chunk_size
+                provider_idx += 1
 
         logger.info(f"  Prepared {len(chunks)} chunks, processing with {max_workers} concurrent workers")
 
