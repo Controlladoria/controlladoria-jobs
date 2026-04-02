@@ -80,7 +80,7 @@ class Settings(BaseSettings):
 
     # Amazon Nova (via AWS Bedrock) — secondary
     # Uses IAM credentials (aws_access_key_id/aws_secret_access_key below), not API keys
-    nova_model: str = "us.amazon.nova-lite-v2:0"  # Cross-region inference
+    nova_model: str = "us.amazon.nova-2-lite-v1:0"  # Cross-region inference
     nova_region: str = "us-east-2"  # Bedrock region
 
     # OpenAI — tertiary fallback

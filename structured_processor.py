@@ -374,82 +374,90 @@ class StructuredDocumentProcessor:
 
     def _call_with_failover(self, extraction_type: str, *args, **kwargs):
         """
-        Try all keys for the primary provider, then failover to secondary.
+        Try all providers and keys in multiple rounds until one succeeds.
 
-        For each key:
-        1. Set the thread-local client
-        2. Call the provider-specific extraction method (with retry)
-        3. Report success/error to key pool
+        Round 1: cycle through all providers and all their keys.
+        Round 2+: wait for rate-limited/unhealthy keys to recover, then retry.
+        Up to MAX_ROUNDS attempts before giving up.
 
-        Returns the extraction result (FinancialDocument or dict).
-        Raises the last exception if all keys/providers are exhausted.
+        This ensures we exhaust every option — not just a single pass.
         """
-        # Use full provider priority list (configured providers + implicit failover)
-        # provider_priority already has configured providers first, then failover
+        MAX_ROUNDS = 3
+        ROUND_DELAY_SECONDS = [0, 10, 30]  # wait before round 2, 3
+
         providers_to_try = list(self.provider_priority) if self.ai_failover_enabled else list(self.ai_providers)
 
         last_exception = None
 
-        for provider in providers_to_try:
-            method = self._get_extraction_method(provider, extraction_type)
-            if not method:
-                logger.warning(
-                    f"No method for ({provider}, {extraction_type}), skipping"
-                )
-                continue
-
-            # Try all keys for this provider
-            tried_keys = 0
-            while True:
-                key_state = self.key_pool.get_next_key(provider)
-                if not key_state:
-                    break  # No more available keys for this provider
-                tried_keys += 1
-
-                # Set up thread-local client for this key
-                client = self._get_or_create_client(provider, key_state.key)
-                self._thread_local.client = client
-                # Also set the model for the current provider
-                self._thread_local.provider = provider
-
-                try:
-                    result = method(*args, **kwargs)
-                    self.key_pool.report_success(key_state)
-                    logger.info(
-                        f"✓ AI call success: {provider} key {key_state.key_suffix} "
-                        f"(type: {extraction_type})"
-                    )
-                    return result
-                except Exception as e:
-                    last_exception = e
-
-                    # 400 client errors (bad format, unsupported MIME) are NOT key issues
-                    # Don't punish the key and don't retry with different keys
-                    if self._is_client_error(e):
-                        logger.error(
-                            f"❌ AI call failed with client error (no retry): {e}"
-                        )
-                        break  # Skip to next provider, same error with any key
-
-                    is_rate_limit = self._is_rate_limit_error(e)
-                    self.key_pool.report_error(key_state, is_rate_limit=is_rate_limit)
-                    logger.warning(
-                        f"⚠️  AI call failed: {provider} key {key_state.key_suffix} "
-                        f"({'rate-limited' if is_rate_limit else type(e).__name__}): {e}"
-                    )
-                    # Continue to next key
-
-            if tried_keys == 0 and provider == providers_to_try[0]:
-                logger.warning(
-                    f"No available keys for primary provider {provider}"
-                )
-
-            if provider != providers_to_try[-1]:
+        for round_num in range(MAX_ROUNDS):
+            # Wait before retry rounds (lets rate-limited keys recover)
+            if round_num > 0:
+                delay = ROUND_DELAY_SECONDS[min(round_num, len(ROUND_DELAY_SECONDS) - 1)]
                 logger.info(
-                    f"Failing over from {provider} to next provider..."
+                    f"Round {round_num + 1}/{MAX_ROUNDS}: waiting {delay}s for keys to recover..."
                 )
+                time.sleep(delay)
 
-        # All providers exhausted
+            for provider in providers_to_try:
+                method = self._get_extraction_method(provider, extraction_type)
+                if not method:
+                    continue
+
+                # Try all available keys for this provider
+                tried_keys = 0
+                while True:
+                    key_state = self.key_pool.get_next_key(provider)
+                    if not key_state:
+                        break
+                    tried_keys += 1
+
+                    client = self._get_or_create_client(provider, key_state.key)
+                    self._thread_local.client = client
+                    self._thread_local.provider = provider
+
+                    try:
+                        result = method(*args, **kwargs)
+                        self.key_pool.report_success(key_state)
+                        if round_num > 0:
+                            logger.info(
+                                f"✓ AI call success on round {round_num + 1}: "
+                                f"{provider} key {key_state.key_suffix} (type: {extraction_type})"
+                            )
+                        else:
+                            logger.info(
+                                f"✓ AI call success: {provider} key {key_state.key_suffix} "
+                                f"(type: {extraction_type})"
+                            )
+                        return result
+                    except Exception as e:
+                        last_exception = e
+
+                        if self._is_client_error(e):
+                            logger.error(
+                                f"Client error (no retry): {e}"
+                            )
+                            break  # Same error with any key — skip provider
+
+                        is_rate_limit = self._is_rate_limit_error(e)
+                        self.key_pool.report_error(key_state, is_rate_limit=is_rate_limit)
+                        logger.warning(
+                            f"AI call failed: {provider} key {key_state.key_suffix} "
+                            f"({'rate-limited' if is_rate_limit else type(e).__name__}): {e}"
+                        )
+
+                if tried_keys == 0 and round_num == 0:
+                    logger.warning(f"No available keys for {provider}")
+
+            # Check if any keys might recover on next round
+            if round_num < MAX_ROUNDS - 1:
+                available = self.key_pool.get_all_providers()
+                if not available:
+                    logger.info(
+                        f"All keys exhausted after round {round_num + 1}, "
+                        f"waiting for recovery before round {round_num + 2}..."
+                    )
+
+        # All rounds exhausted
         if last_exception:
             raise last_exception
         raise ValueError("No AI API keys available for extraction")
@@ -777,7 +785,7 @@ class StructuredDocumentProcessor:
 
             # Check total row count to decide chunking strategy
             total_rows = sum(len(df) for _, df in all_dfs)
-            CHUNK_THRESHOLD = 500  # rows above which we chunk to avoid blowing up AI context
+            CHUNK_THRESHOLD = 200  # rows above which we chunk to avoid blowing up AI context
 
             # PRIMARY PATH: Always send to AI for extraction
             logger.info(f"🤖 Sending Excel to AI ({self.ai_provider}) for extraction... ({total_rows} total rows)")
@@ -976,7 +984,7 @@ class StructuredDocumentProcessor:
         import pandas as pd
         from models import TransactionLedger, Transaction, DateRangeSummary
 
-        CHUNK_SIZE = 500
+        CHUNK_SIZE = 200
         all_transactions = []
         chunk_index = 0
 
@@ -1012,15 +1020,18 @@ class StructuredDocumentProcessor:
                         all_transactions.extend(result.transactions)
                     elif hasattr(result, "transactions") and result.transactions:
                         all_transactions.extend(result.transactions)
+
+                    # Brief pause between chunks to avoid rate limit storms
+                    if chunk_index > 1:
+                        time.sleep(2)
                 except Exception as e:
                     logger.warning(f"  Chunk {chunk_index} AI extraction failed: {e}")
                     # Continue with remaining chunks — partial extraction is better than none
 
         if not all_transactions:
-            # All chunks failed — return empty FinancialDocument so caller hits fallback
+            # All chunks failed — return empty FinancialDocument so caller hits pandas fallback
             return FinancialDocument(
                 document_type="transaction_ledger",
-                document_number=filename,
             )
 
         # Merge all chunk transactions into a single TransactionLedger
@@ -1041,7 +1052,7 @@ class StructuredDocumentProcessor:
 
         ledger = TransactionLedger(
             document_type="transaction_ledger",
-            document_number=filename,
+            file_name=filename,
             total_transactions=len(all_transactions),
             total_income=total_income,
             total_expense=total_expense,

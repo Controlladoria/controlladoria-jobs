@@ -179,10 +179,11 @@ def _process_document(document_id: int, file_path: str):
             if result["status"] == "success":
                 extracted_data = result["extracted_data"]
 
-                # Fix temp filename in document_number
-                doc_num = extracted_data.document_number
-                if doc_num and ("tmp" in doc_num.lower() and doc_num.lower().endswith((".xlsx", ".xls", ".csv"))):
-                    extracted_data.document_number = doc.file_name
+                # Fix temp filename in document_number (FinancialDocument only, TransactionLedger doesn't have it)
+                if hasattr(extracted_data, "document_number"):
+                    doc_num = extracted_data.document_number
+                    if doc_num and ("tmp" in doc_num.lower() and doc_num.lower().endswith((".xlsx", ".xls", ".csv"))):
+                        extracted_data.document_number = doc.file_name
 
                 data_dict = extracted_data.model_dump()
 

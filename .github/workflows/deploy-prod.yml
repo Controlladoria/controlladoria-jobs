@@ -121,13 +121,18 @@ jobs:
 
       - name: Ensure SQS trigger exists
         run: |
-          EXISTING=$(aws lambda list-event-source-mappings --function-name controlladoria-worker-document-processing-prod \
-            --query "EventSourceMappings[?contains(EventSourceArn, 'controlladoria-document-processing-prod')]" --output text)
-          if [ -z "$EXISTING" ]; then
+          UUID=$(aws lambda list-event-source-mappings --function-name controlladoria-worker-document-processing-prod \
+            --query "EventSourceMappings[?contains(EventSourceArn, 'controlladoria-document-processing-prod')].UUID | [0]" --output text)
+          if [ "$UUID" = "None" ] || [ -z "$UUID" ]; then
             aws lambda create-event-source-mapping \
               --function-name controlladoria-worker-document-processing-prod \
               --event-source-arn "${{ secrets.PROD_SQS_DOCUMENT_PROCESSING_ARN }}" \
               --batch-size 1 \
+              --scaling-config '{"MaximumConcurrency": 50}' \
+              --no-cli-pager
+          else
+            aws lambda update-event-source-mapping \
+              --uuid "$UUID" \
               --scaling-config '{"MaximumConcurrency": 50}' \
               --no-cli-pager
           fi

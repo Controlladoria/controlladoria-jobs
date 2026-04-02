@@ -111,14 +111,20 @@ jobs:
       - name: Ensure SQS trigger exists
         run: |
           # Document processing trigger (SQS → Lambda)
-          EXISTING=$(aws lambda list-event-source-mappings --function-name controlladoria-worker-document-processing-dev \
-            --query "EventSourceMappings[?contains(EventSourceArn, 'controlladoria-document-processing-dev')]" --output text)
-          if [ -z "$EXISTING" ]; then
+          UUID=$(aws lambda list-event-source-mappings --function-name controlladoria-worker-document-processing-dev \
+            --query "EventSourceMappings[?contains(EventSourceArn, 'controlladoria-document-processing-dev')].UUID | [0]" --output text)
+          if [ "$UUID" = "None" ] || [ -z "$UUID" ]; then
             echo "Creating SQS trigger for document processing..."
             aws lambda create-event-source-mapping \
               --function-name controlladoria-worker-document-processing-dev \
               --event-source-arn "${{ secrets.DEV_SQS_DOCUMENT_PROCESSING_ARN }}" \
               --batch-size 1 \
+              --scaling-config '{"MaximumConcurrency": 10}' \
+              --no-cli-pager
+          else
+            echo "Updating SQS trigger concurrency..."
+            aws lambda update-event-source-mapping \
+              --uuid "$UUID" \
               --scaling-config '{"MaximumConcurrency": 10}' \
               --no-cli-pager
           fi
