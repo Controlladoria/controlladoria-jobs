@@ -52,8 +52,8 @@ def handler(event, context):
             continue
 
         try:
-            # Run the actual document processing
-            _process_document(document_id, local_path)
+            # Run the actual document processing (pass Lambda context for timeout awareness)
+            _process_document(document_id, local_path, lambda_context=context)
         except Exception as e:
             logger.error(f"Document {document_id} processing failed: {e}")
             import traceback
@@ -112,15 +112,19 @@ def _mark_document_failed(document_id: int, error_message: str):
         db.close()
 
 
-def _process_document(document_id: int, file_path: str):
+def _process_document(document_id: int, file_path: str, lambda_context=None):
     """
-    Process a document — extracted from ControlladorIA's routers/documents.py
-    process_document_background(). This is the core AI extraction logic.
+    Process a document with AI extraction.
+
+    Supports incremental chunk saving for large spreadsheets:
+    - Each chunk's transactions are saved as validation rows immediately
+    - Progress tracked in Document.extracted_data_json
+    - On Lambda timeout + SQS retry, resumes from last completed chunk
     """
     from datetime import datetime
     from database import (
-        SessionLocal, Document, DocumentStatus, User, Client,
-        AuditLog, KnownItem, Organization, OrgMembership,
+        SessionLocal, Document, DocumentStatus, DocumentValidationRow,
+        User, Client, AuditLog, KnownItem, Organization, OrgMembership,
     )
     from structured_processor import StructuredDocumentProcessor
     from validation import FinancialValidator
@@ -136,6 +140,7 @@ def _process_document(document_id: int, file_path: str):
     from auth.team_management import get_organization_owner_id
     from accounting.categories import resolve_category_name
     from accounting import is_income_type
+    from sqlalchemy import func
 
     processor = StructuredDocumentProcessor()
     db = SessionLocal()
@@ -155,6 +160,21 @@ def _process_document(document_id: int, file_path: str):
                 "cnpj": user.cnpj,
             }
 
+        # Check for resume — if we have progress from a previous run
+        progress = {}
+        skip_chunks = None
+        try:
+            if doc.extracted_data_json:
+                progress = json.loads(doc.extracted_data_json)
+                if isinstance(progress, dict) and "chunks_completed" in progress:
+                    skip_chunks = set(progress["chunks_completed"])
+                    logger.info(
+                        f"Resuming document {document_id}: "
+                        f"{len(skip_chunks)}/{progress.get('chunks_total', '?')} chunks already done"
+                    )
+        except (json.JSONDecodeError, TypeError):
+            pass
+
         # Update status to processing
         doc.status = DocumentStatus.PROCESSING
         db.commit()
@@ -168,6 +188,63 @@ def _process_document(document_id: int, file_path: str):
         except Exception as e:
             logger.warning(f"Failed to load known items: {e}")
 
+        # --- Incremental chunk saving callback ---
+        # Count existing validation rows (from previous partial run)
+        existing_row_count = (
+            db.query(func.count(DocumentValidationRow.id))
+            .filter(DocumentValidationRow.document_id == document_id)
+            .scalar() or 0
+        )
+        row_offset = existing_row_count  # Start row_index after existing rows
+
+        def on_chunk_complete(chunk_index, transactions):
+            """Save this chunk's transactions as validation rows immediately."""
+            nonlocal row_offset
+            for i, txn in enumerate(transactions):
+                amt = txn.amount if hasattr(txn, 'amount') else float(txn.get('amount', 0) if isinstance(txn, dict) else 0)
+                desc = txn.description if hasattr(txn, 'description') else (txn.get('description', '') if isinstance(txn, dict) else '')
+                date = txn.date if hasattr(txn, 'date') else (txn.get('date', '') if isinstance(txn, dict) else '')
+                cat = txn.category if hasattr(txn, 'category') else (txn.get('category', '') if isinstance(txn, dict) else '')
+                txn_type = txn.transaction_type if hasattr(txn, 'transaction_type') else (txn.get('transaction_type', '') if isinstance(txn, dict) else '')
+                counterparty = txn.counterparty if hasattr(txn, 'counterparty') else (txn.get('counterparty', '') if isinstance(txn, dict) else '')
+
+                row = DocumentValidationRow(
+                    document_id=document_id,
+                    row_index=row_offset + i,
+                    description=(desc or '').upper()[:500],
+                    transaction_date=str(date) if date else None,
+                    amount=int(float(amt) * 100) if amt else 0,
+                    category=cat or 'nao_categorizado',
+                    transaction_type=txn_type or 'despesa',
+                    is_validated=False,
+                    original_data_json=json.dumps(
+                        txn.model_dump() if hasattr(txn, 'model_dump') else txn,
+                        default=str
+                    ) if txn else None,
+                )
+                db.add(row)
+            row_offset += len(transactions)
+            db.flush()
+
+            # Update progress tracker on document
+            progress.setdefault("chunks_completed", []).append(chunk_index)
+            doc.extracted_data_json = json.dumps(progress, default=str)
+            db.commit()
+            logger.debug(f"  Saved {len(transactions)} rows for chunk {chunk_index} (total rows: {row_offset})")
+
+        # --- Lambda timeout awareness ---
+        def should_stop():
+            """Return True if Lambda has < 60 seconds remaining."""
+            if lambda_context and hasattr(lambda_context, 'get_remaining_time_in_millis'):
+                remaining = lambda_context.get_remaining_time_in_millis()
+                return remaining < 60000  # 60 seconds buffer
+            return False
+
+        # Wire up the callbacks on the processor
+        processor._on_chunk_complete = on_chunk_complete
+        processor._skip_chunks = skip_chunks
+        processor._should_stop = should_stop
+
         # Process document with AI
         try:
             result = processor.process_document(
@@ -175,6 +252,17 @@ def _process_document(document_id: int, file_path: str):
                 user_company_info=user_company_info,
                 known_items=known_items_context if known_items_context else None,
             )
+
+            if result["status"] == "partial":
+                # Chunked processing stopped early (Lambda timeout) — rows already saved
+                # Keep status as PROCESSING so the SQS retry picks it up
+                logger.info(
+                    f"Document {document_id} partially processed — "
+                    f"{row_offset} rows saved so far. Will resume on retry."
+                )
+                # Don't change status — stays PROCESSING, SQS will retry
+                db.commit()
+                return
 
             if result["status"] == "success":
                 extracted_data = result["extracted_data"]
@@ -287,8 +375,16 @@ def _process_document(document_id: int, file_path: str):
                 if data_dict.get("is_cancellation") and data_dict.get("original_document_number"):
                     _handle_nfe_cancellation(db, doc, data_dict)
 
-                # Create validation rows
-                _create_validation_rows(db, doc, data_dict)
+                # Create validation rows (skip if already saved incrementally by chunk callback)
+                existing_rows = (
+                    db.query(func.count(DocumentValidationRow.id))
+                    .filter(DocumentValidationRow.document_id == document_id)
+                    .scalar() or 0
+                )
+                if existing_rows == 0:
+                    _create_validation_rows(db, doc, data_dict)
+                else:
+                    logger.debug(f"Skipping _create_validation_rows — {existing_rows} rows already saved incrementally")
 
                 # Batch-categorize uncategorized rows
                 try:

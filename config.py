@@ -197,6 +197,7 @@ class Settings(BaseSettings):
 
     # Validation Settings
     enable_cnpj_validation: bool = True  # Strict CNPJ validation for Nota Fiscal uploads (rejects if user CNPJ doesn't match document)
+    enable_plan_limits: bool = False  # Release toggle: enforce spreadsheet limits per plan. Set True for production.
 
     # Rate Limiting
     rate_limit_enabled: bool = True

@@ -811,7 +811,21 @@ class StructuredDocumentProcessor:
                 else:
                     # Large file — process in chunks and merge results
                     logger.debug(f"Large Excel ({total_rows} rows) -- chunking into ~{CHUNK_THRESHOLD}-row batches")
-                    structured_data = self._process_excel_chunked(all_dfs, excel_path.name)
+                    structured_data = self._process_excel_chunked(
+                        all_dfs, excel_path.name,
+                        on_chunk_complete=getattr(self, '_on_chunk_complete', None),
+                        skip_chunks=getattr(self, '_skip_chunks', None),
+                        should_stop=getattr(self, '_should_stop', None),
+                    )
+
+                # None = partial completion (timeout/resume) — rows already saved by callback
+                if structured_data is None:
+                    return {
+                        "file_name": excel_path.name,
+                        "file_type": "excel",
+                        "status": "partial",
+                        "extracted_data": None,
+                    }
 
                 # Validate AI result has usable data
                 ai_success = False
@@ -987,13 +1001,18 @@ class StructuredDocumentProcessor:
 
         return "\n".join(text_parts)
 
-    def _process_excel_chunked(self, all_dfs: list, filename: str):
+    def _process_excel_chunked(self, all_dfs: list, filename: str,
+                                on_chunk_complete=None, skip_chunks=None,
+                                should_stop=None):
         """
         Process a large Excel file by splitting into chunks, extracting each
         chunk with AI IN PARALLEL, and merging the results into a single TransactionLedger.
 
-        Chunks are distributed across providers (round-robin) and run concurrently
-        using ThreadPoolExecutor. With 3 providers, 3 chunks run at once.
+        Args:
+            on_chunk_complete: Optional callback(chunk_index, transactions_list) called
+                after each chunk succeeds. Used by Lambda to save rows incrementally.
+            skip_chunks: Optional set of chunk indices to skip (already processed on previous run).
+            should_stop: Optional callable() that returns True if we should stop (Lambda timeout).
         """
         import pandas as pd
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1090,13 +1109,41 @@ class StructuredDocumentProcessor:
                 self.ai_provider = original
                 self._thread_local._chunk_prompt = None  # Clear so non-chunk calls use normal prompt
 
+        # Filter out already-completed chunks (resume support)
+        if skip_chunks:
+            chunks = [c for c in chunks if c[0] not in skip_chunks]
+            logger.info(f"  Resuming: skipping {len(skip_chunks)} already-completed chunks, {len(chunks)} remaining")
+
+        if not chunks:
+            # All chunks already done from previous run — return empty, caller will finalize
+            return None
+
         # Run chunks in parallel — max_workers threads at once
         all_results = {}
+        stopped_early = False
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(process_chunk, chunk): chunk[0] for chunk in chunks}
             for future in as_completed(futures):
                 idx, transactions, error = future.result()
                 all_results[idx] = transactions
+
+                # Call the save callback for each completed chunk
+                if transactions and on_chunk_complete:
+                    try:
+                        on_chunk_complete(idx, transactions)
+                    except Exception as e:
+                        logger.warning(f"  Chunk {idx} save callback failed: {e}")
+
+                # Check if we should stop (Lambda timeout approaching)
+                if should_stop and should_stop():
+                    logger.info(f"  Stopping early — timeout approaching. Completed {len(all_results)} of {len(chunks)} chunks.")
+                    stopped_early = True
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+
+        if stopped_early:
+            # Return None to signal partial completion — caller handles finalization
+            return None
 
         # Merge in original chunk order (important for row ordering)
         all_transactions = []
@@ -2050,17 +2097,72 @@ Return ONLY a valid JSON object (no markdown):
 
 For transaction_type: if the sheet name or column headers indicate "Recebimentos", "Receitas", "Faturamento" → "income". If "Pagamentos", "Despesas", "Compras" → "expense". If unclear, default to "expense".
 
-CATEGORY — MANDATORY for every transaction. Analyze the description and counterparty to pick the best match:
-  RECEITA: "receita_vendas_produtos", "receita_servicos", "receita_locacao", "receita_comissoes", "receita_contratos_recorrentes"
-  DEDUCOES: "impostos_sobre_vendas", "devolucoes", "descontos_concedidos"
-  CUSTOS VARIAVEIS: "cmv", "csp", "materia_prima", "insumos", "comissoes_sobre_vendas"
-  CUSTOS FIXOS: "salarios_producao", "encargos_sociais_producao", "energia_producao", "manutencao_equipamentos_producao"
-  DESPESAS ADMIN: "salarios_administrativos", "pro_labore", "encargos_sociais_administrativos", "aluguel", "condominio", "agua_energia", "material_escritorio", "honorarios_contabeis", "sistemas_softwares", "telefonia_internet"
-  DESPESAS COMERCIAIS: "marketing_publicidade", "propaganda_digital", "comissao_vendas", "fretes", "representantes_comerciais"
-  FINANCEIRO: "receita_financeira", "juros_ativos", "descontos_obtidos", "juros_passivos", "tarifas_bancarias", "iof", "multas_encargos"
-  TRIBUTOS: "irpj", "csll", "simples_nacional", "iptu", "taxas_municipais"
-  OUTRAS: "recuperacao_despesas", "venda_imobilizado", "indenizacoes_recebidas", "outras_receitas_eventuais", "perdas", "indenizacoes_pagas", "doacoes", "provisoes", "depreciacao", "amortizacao", "outras_despesas_operacionais"
-  "nao_categorizado" — ABSOLUTE LAST RESORT ONLY. Try HARD to match a real category first. Analyze the description, the counterparty name, the sheet name, everything. There is almost always a matching category.
+CATEGORY + TRANSACTION TYPE — BOTH MANDATORY for every transaction.
+The category determines the transaction_type. Use this EXACT chart of accounts (Plano de Contas):
+
+RECEITA (transaction_type = "receita"):
+  1.1.01 "receita_vendas_produtos" — Receita de Vendas de Produtos
+  1.1.02 "receita_servicos" — Receita de Prestacao de Servicos
+  1.1.03 "receita_locacao" — Receita de Locacao
+  1.1.04 "receita_comissoes" — Receita de Comissoes
+  1.1.05 "receita_contratos_recorrentes" — Receita de Contratos Recorrentes
+DEDUCAO (transaction_type = "deducao"):
+  1.2.01 "impostos_sobre_vendas" — Impostos sobre Vendas
+  1.2.02 "devolucoes" — Devolucoes
+  1.2.03 "descontos_concedidos" — Descontos Concedidos
+CUSTO (transaction_type = "custo") — THIS IS NOT DESPESA:
+  2.1.01 "cmv" — Custo das Mercadorias Vendidas
+  2.1.02 "csp" — Custo dos Servicos Prestados
+  2.1.03 "materia_prima" — Materia-Prima
+  2.1.04 "insumos" — Insumos
+  2.1.05 "comissoes_sobre_vendas" — Comissoes sobre Vendas
+  2.2.01 "salarios_producao" — Salarios Producao (THIS IS CUSTO, NOT DESPESA!)
+  2.2.02 "encargos_sociais_producao" — Encargos Sociais Producao
+  2.2.03 "energia_producao" — Energia Producao
+  2.2.04 "manutencao_equipamentos_producao" — Manutencao Equipamentos
+DESPESA OPERACIONAL (transaction_type = "despesa"):
+  3.1.01 "salarios_administrativos" — Salarios Administrativos
+  3.1.02 "pro_labore" — Pro-labore
+  3.1.03 "encargos_sociais_administrativos" — Encargos Sociais Administrativos
+  3.1.04 "aluguel" — Aluguel
+  3.1.05 "condominio" — Condominio
+  3.1.06 "agua_energia" — Agua e Energia
+  3.1.07 "material_escritorio" — Material de Escritorio
+  3.1.08 "honorarios_contabeis" — Honorarios Contabeis
+  3.1.09 "sistemas_softwares" — Sistemas e Softwares
+  3.1.10 "telefonia_internet" — Telefonia e Internet
+  3.2.01 "marketing_publicidade" — Marketing e Publicidade
+  3.2.02 "propaganda_digital" — Propaganda Digital
+  3.2.03 "comissao_vendas" — Comissao de Vendas
+  3.2.04 "fretes" — Fretes
+  3.2.05 "representantes_comerciais" — Representantes Comerciais
+FINANCEIRO (transaction_type depends on direction):
+  1.4.01 "receita_financeira" — Receita Financeira (transaction_type = "receita")
+  1.4.02 "juros_ativos" — Juros Ativos (transaction_type = "receita")
+  1.4.03 "descontos_obtidos" — Descontos Obtidos (transaction_type = "receita")
+  3.3.01 "juros_passivos" — Juros Passivos (transaction_type = "despesa")
+  3.3.02 "tarifas_bancarias" — Tarifas Bancarias (transaction_type = "despesa")
+  3.3.03 "iof" — IOF (transaction_type = "despesa")
+  3.3.04 "multas_encargos" — Multas e Encargos (transaction_type = "despesa")
+TRIBUTOS (transaction_type = "despesa"):
+  3.4.01 "irpj" — IRPJ
+  3.4.02 "csll" — CSLL
+  3.4.03 "simples_nacional" — Simples Nacional
+  3.4.04 "iptu" — IPTU
+  3.4.05 "taxas_municipais" — Taxas Municipais
+OUTRAS RECEITAS (transaction_type = "receita"):
+  1.4.04 "recuperacao_despesas" — Recuperacao de Despesas
+  1.5.01 "venda_imobilizado" — Venda de Imobilizado
+  1.5.02 "indenizacoes_recebidas" — Indenizacoes Recebidas
+  1.5.03 "outras_receitas_eventuais" — Outras Receitas Eventuais
+OUTRAS DESPESAS (transaction_type = "despesa"):
+  3.5.01 "perdas" — Perdas
+  3.5.02 "indenizacoes_pagas" — Indenizacoes Pagas
+  3.5.03 "doacoes" — Doacoes
+  3.5.04 "provisoes" — Provisoes
+
+CRITICAL: Salarios/Encargos PRODUCAO (2.2.xx) = CUSTO. Salarios/Encargos ADMINISTRATIVOS (3.1.xx) = DESPESA. Do NOT confuse them!
+"nao_categorizado" — ABSOLUTE LAST RESORT. There is almost always a matching category above.
 
 REMEMBER: Output MUST have the EXACT same number of transactions as rows in the input data."""
 
@@ -2227,18 +2329,19 @@ Important rules for Brazilian documents:
 - Dates: convert to YYYY-MM-DD format (from dd/mm/yyyy if needed)
 - CNPJ format: XX.XXX.XXX/XXXX-XX (14 digits)
 - CPF format: XXX.XXX.XXX-XX (11 digits)
-- **CATEGORY FIELD** - Use EXACTLY one of these V2 category names (Plano de Contas):
-  RECEITA (Revenue): "receita_vendas_produtos", "receita_servicos", "receita_locacao", "receita_comissoes", "receita_contratos_recorrentes"
-  DEDUÇÕES (Deductions): "impostos_sobre_vendas", "devolucoes", "descontos_concedidos"
-  CUSTOS VARIÁVEIS (Variable Costs): "cmv", "csp", "materia_prima", "insumos", "comissoes_sobre_vendas"
-  CUSTOS FIXOS PRODUÇÃO (Fixed Production Costs): "salarios_producao", "encargos_sociais_producao", "energia_producao", "manutencao_equipamentos_producao"
-  DESPESAS ADMIN (Admin Expenses): "salarios_administrativos", "pro_labore", "encargos_sociais_administrativos", "aluguel", "condominio", "agua_energia", "material_escritorio", "honorarios_contabeis", "sistemas_softwares", "telefonia_internet"
-  DESPESAS COMERCIAIS (Commercial): "marketing_publicidade", "propaganda_digital", "comissao_vendas", "fretes", "representantes_comerciais"
-  FINANCEIRO (Financial): "receita_financeira", "juros_ativos", "descontos_obtidos", "juros_passivos", "tarifas_bancarias", "iof", "multas_encargos"
-  TRIBUTOS (Taxes): "irpj", "csll", "simples_nacional", "iptu", "taxas_municipais"
-  OUTRAS (Other): "recuperacao_despesas", "venda_imobilizado", "indenizacoes_recebidas", "outras_receitas_eventuais", "perdas", "indenizacoes_pagas", "doacoes", "provisoes", "depreciacao", "amortizacao", "outras_despesas_operacionais"
-  FALLBACK: "nao_categorizado" (use ONLY as absolute last resort - try hard to match a real category first)
-- **CRITICAL - CATEGORY IS MANDATORY**: You MUST assign a category to EVERY item and to the document itself. Never leave category as null or empty. Analyze each item's description and assign the most appropriate category from the list above. For bank statements, PIX transfers, card purchases etc., categorize based on the description (e.g., card purchase → "outras_despesas_operacionais", bank fees → "tarifas_bancarias", PIX sent → analyze context). Each line_item MUST have its own "category" field.
+- **CATEGORY + TRANSACTION TYPE** — BOTH MANDATORY. The category determines the transaction_type. Use this EXACT Plano de Contas:
+  RECEITA (transaction_type="receita"): "receita_vendas_produtos", "receita_servicos", "receita_locacao", "receita_comissoes", "receita_contratos_recorrentes"
+  DEDUCAO (transaction_type="deducao"): "impostos_sobre_vendas", "devolucoes", "descontos_concedidos"
+  CUSTO (transaction_type="custo" — NOT despesa!): "cmv", "csp", "materia_prima", "insumos", "comissoes_sobre_vendas", "salarios_producao", "encargos_sociais_producao", "energia_producao", "manutencao_equipamentos_producao"
+  DESPESA (transaction_type="despesa"): "salarios_administrativos", "pro_labore", "encargos_sociais_administrativos", "aluguel", "condominio", "agua_energia", "material_escritorio", "honorarios_contabeis", "sistemas_softwares", "telefonia_internet", "marketing_publicidade", "propaganda_digital", "comissao_vendas", "fretes", "representantes_comerciais"
+  FINANCEIRO RECEITA (transaction_type="receita"): "receita_financeira", "juros_ativos", "descontos_obtidos"
+  FINANCEIRO DESPESA (transaction_type="despesa"): "juros_passivos", "tarifas_bancarias", "iof", "multas_encargos"
+  TRIBUTOS (transaction_type="despesa"): "irpj", "csll", "simples_nacional", "iptu", "taxas_municipais"
+  OUTRAS RECEITAS (transaction_type="receita"): "recuperacao_despesas", "venda_imobilizado", "indenizacoes_recebidas", "outras_receitas_eventuais"
+  OUTRAS DESPESAS (transaction_type="despesa"): "perdas", "indenizacoes_pagas", "doacoes", "provisoes"
+  CRITICAL: Salarios PRODUCAO = CUSTO (2.2.xx). Salarios ADMINISTRATIVOS = DESPESA (3.1.xx). Do NOT confuse them!
+  FALLBACK: "nao_categorizado" (ABSOLUTE last resort)
+- **CATEGORY IS MANDATORY**: Assign a category to EVERY item and to the document. Never null. Each line_item MUST have its own "category" field.
 - Common payment methods: "pix", "boleto", "cartao_credito", "transferencia", "dinheiro"
 - **EXCEL/SPREADSHEET WITH MULTIPLE TRANSACTIONS**: If the document is an Excel spreadsheet, bank statement, or ledger with multiple transactions (one per row), use the "transactions" array (NOT "line_items"). Each transaction should have its own date, description, category, amount, transaction_type, and counterparty (supplier/client name if present in the data). If each row has a different supplier/client, capture that in the counterparty field of each transaction.
 - **INVOICES WITH PRODUCTS**: For invoices/receipts with product line items, use "line_items" array.

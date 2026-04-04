@@ -949,6 +949,53 @@ async def upload_document(
     if file_ext not in settings.allowed_file_extensions:
         raise HTTPException(status_code=400, detail=msg["unsupported_file_type"])
 
+    # --- Spreadsheet plan limits (behind release toggle) ---
+    is_spreadsheet = file_ext in [".xlsx", ".xls", ".csv"]
+    if is_spreadsheet and settings.enable_plan_limits:
+        plan = subscription.plan
+        plan_features = plan.features if plan else {}
+
+        # Check monthly spreadsheet count
+        max_spreadsheets = plan_features.get("max_spreadsheets_per_month")
+        if max_spreadsheets is not None:
+            from datetime import datetime
+            month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            spreadsheet_count = (
+                db.query(func.count(Document.id))
+                .filter(
+                    Document.user_id == current_user.id,
+                    Document.file_type.in_(["xlsx", "xls", "csv"]),
+                    Document.upload_date >= month_start,
+                )
+                .scalar() or 0
+            )
+            if spreadsheet_count >= max_spreadsheets:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Limite de {max_spreadsheets} planilhas/mês atingido no plano {plan.display_name}. Faça upgrade para enviar mais.",
+                )
+
+        # Check max rows per spreadsheet
+        max_rows = plan_features.get("max_spreadsheet_rows")
+        if max_rows is not None:
+            try:
+                import pandas as pd
+                import io as _io
+                xls = pd.ExcelFile(_io.BytesIO(contents))
+                total_rows = sum(
+                    pd.read_excel(xls, sheet_name=sheet).shape[0]
+                    for sheet in xls.sheet_names
+                )
+                if total_rows > max_rows:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Esta planilha tem {total_rows:,} linhas. O plano {plan.display_name} suporta até {max_rows:,} linhas. Faça upgrade para processar arquivos maiores.",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass  # Can't count rows — let it through, AI will handle it
+
     # Validate MIME type if python-magic is available
     if MAGIC_AVAILABLE:
         try:
@@ -2532,8 +2579,16 @@ async def list_pending_validation_documents(
     total = query.count()
     docs = query.offset(skip).limit(limit).all()
 
+    # Also count docs still being processed (pending + processing)
+    processing_count = (
+        base_query
+        .filter(Document.status.in_([DocumentStatus.PENDING, DocumentStatus.PROCESSING]))
+        .count()
+    )
+
     return {
         "total": total,
+        "processing_count": processing_count,
         "documents": [
             {
                 "id": doc.id,
@@ -2829,32 +2884,23 @@ async def confirm_document_validation(
             detail="Documento não está pendente de validação.",
         )
 
-    # Mark all unvalidated rows as validated
-    rows = (
-        db.query(DocumentValidationRow)
-        .filter(
-            DocumentValidationRow.document_id == document_id,
-            DocumentValidationRow.is_validated == False,
-        )
-        .all()
-    )
-
+    # Bulk mark all unvalidated rows as validated (single SQL UPDATE, no Python loop)
     now = datetime.utcnow()
-    for row in rows:
-        row.is_validated = True
-        row.validated_at = now
+    db.query(DocumentValidationRow).filter(
+        DocumentValidationRow.document_id == document_id,
+        DocumentValidationRow.is_validated == False,
+    ).update({"is_validated": True, "validated_at": now}, synchronize_session="fetch")
 
-    # Update the extracted_data_json with any user modifications
-    all_rows = (
-        db.query(DocumentValidationRow)
-        .filter(DocumentValidationRow.document_id == document_id)
-        .order_by(DocumentValidationRow.row_index)
-        .all()
-    )
+    # Get row count for this document
+    total_row_count = db.query(func.count(DocumentValidationRow.id)).filter(
+        DocumentValidationRow.document_id == document_id
+    ).scalar() or 0
 
     # If this was a single-transaction doc, update the main fields
-    if len(all_rows) == 1:
-        row = all_rows[0]
+    if total_row_count == 1:
+        row = db.query(DocumentValidationRow).filter(
+            DocumentValidationRow.document_id == document_id
+        ).first()
         try:
             data = json.loads(doc.extracted_data_json) if doc.extracted_data_json else {}
             if row.category:
@@ -2870,67 +2916,104 @@ async def confirm_document_validation(
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # If multi-transaction doc, update the transactions list and/or line_items
-    elif len(all_rows) > 1:
+    # If multi-transaction doc, compute totals with SQL aggregation (not Python loops)
+    elif total_row_count > 1:
         try:
             data = json.loads(doc.extracted_data_json) if doc.extracted_data_json else {}
             is_ledger = data.get("document_type") == "transaction_ledger"
 
             if is_ledger or not data.get("line_items"):
-                # Ledger or doc without line_items: write as transactions
+                # Use SQL aggregation for totals — avoid loading 2700 rows into Python
+                from sqlalchemy import case
+                totals = db.query(
+                    func.count(DocumentValidationRow.id).label("count"),
+                    func.sum(func.abs(DocumentValidationRow.amount)).label("total_sum"),
+                    func.sum(case(
+                        (DocumentValidationRow.transaction_type == "receita",
+                         func.abs(DocumentValidationRow.amount)),
+                        else_=0
+                    )).label("income_sum"),
+                    func.sum(case(
+                        (DocumentValidationRow.transaction_type != "receita",
+                         func.abs(DocumentValidationRow.amount)),
+                        else_=0
+                    )).label("expense_sum"),
+                ).filter(
+                    DocumentValidationRow.document_id == document_id
+                ).first()
+
+                item_count = totals.count or 0
+                total_sum = (totals.total_sum or 0) / 100.0
+                income_sum = (totals.income_sum or 0) / 100.0
+                expense_sum = (totals.expense_sum or 0) / 100.0
+
+                # Build transactions list in batches to avoid loading all at once
                 updated_transactions = []
-                total_sum = 0
-                item_count = 0
-                income_sum = 0
-                expense_sum = 0
-                for row in all_rows:
-                    amt = row.amount / 100.0 if row.amount is not None else 0
-                    updated_transactions.append({
-                        "date": row.transaction_date,
-                        "description": row.description,
-                        "category": row.category,
-                        "transaction_type": row.transaction_type,
-                        "amount": amt,
-                        "counterparty": row.counterparty if hasattr(row, 'counterparty') and row.counterparty else None,
-                    })
-                    total_sum += abs(amt)
-                    item_count += 1
-                    if row.transaction_type == "receita":
-                        income_sum += abs(amt)
-                    else:
-                        expense_sum += abs(amt)
+                batch_size = 500
+                offset = 0
+                while True:
+                    batch = (
+                        db.query(DocumentValidationRow)
+                        .filter(DocumentValidationRow.document_id == document_id)
+                        .order_by(DocumentValidationRow.row_index)
+                        .offset(offset).limit(batch_size)
+                        .all()
+                    )
+                    if not batch:
+                        break
+                    for row in batch:
+                        amt = row.amount / 100.0 if row.amount is not None else 0
+                        updated_transactions.append({
+                            "date": row.transaction_date,
+                            "description": row.description,
+                            "category": row.category,
+                            "transaction_type": row.transaction_type,
+                            "amount": amt,
+                            "counterparty": row.counterparty if hasattr(row, 'counterparty') and row.counterparty else None,
+                        })
+                    offset += batch_size
+                    db.expire_all()  # Free memory from previous batch
+
                 data["transactions"] = updated_transactions
-                # Update document-level totals from validated rows
                 data["total_amount"] = total_sum
                 data["total_items"] = item_count
-                # Update ledger summary fields (used by TransactionLedger model)
                 data["total_transactions"] = item_count
                 data["total_income"] = income_sum
                 data["total_expense"] = expense_sum
                 data["net_balance"] = income_sum - expense_sum
-                # Set document-level type from majority of transactions
                 data["transaction_type"] = "receita" if income_sum >= expense_sum else "despesa"
             else:
                 # NFe/invoice with line_items: rebuild line_items from rows 1+
-                # Row 0 is the doc header, rows 1+ are items
-                updated_items = []
-                for row in all_rows[1:]:
-                    updated_items.append({
-                        "description": row.description or "",
-                        "total_price": row.amount / 100.0 if row.amount is not None else 0,
-                    })
-                data["line_items"] = updated_items
+                item_rows = (
+                    db.query(DocumentValidationRow)
+                    .filter(DocumentValidationRow.document_id == document_id)
+                    .order_by(DocumentValidationRow.row_index)
+                    .all()
+                )
+                if len(item_rows) > 1:
+                    updated_items = []
+                    for row in item_rows[1:]:
+                        updated_items.append({
+                            "description": row.description or "",
+                            "total_price": row.amount / 100.0 if row.amount is not None else 0,
+                        })
+                    data["line_items"] = updated_items
 
-                # Update header fields from row 0
-                header = all_rows[0]
-                if header.amount is not None:
-                    data["total_amount"] = header.amount / 100.0
-                if header.transaction_type:
-                    data["transaction_type"] = header.transaction_type
+                    # Update header fields from row 0
+                    header = item_rows[0]
+                    if header.amount is not None:
+                        data["total_amount"] = header.amount / 100.0
+                    if header.transaction_type:
+                        data["transaction_type"] = header.transaction_type
 
-            # Set document-level category from the first row (doc header)
-            first_row = all_rows[0]
-            if first_row.category:
+            # Set document-level category from the first row
+            first_row = (
+                db.query(DocumentValidationRow)
+                .filter(DocumentValidationRow.document_id == document_id)
+                .order_by(DocumentValidationRow.row_index)
+                .first()
+            )
+            if first_row and first_row.category:
                 data["category"] = first_row.category
                 doc.category = first_row.category
             doc.extracted_data_json = json.dumps(data, default=str)
@@ -2948,7 +3031,7 @@ async def confirm_document_validation(
         action="validate",
         entity_type="document",
         entity_id=doc.id,
-        changes_summary=f"Document validated and confirmed: {doc.file_name} ({len(all_rows)} rows)",
+        changes_summary=f"Document validated and confirmed: {doc.file_name} ({total_row_count} rows)",
     )
     db.add(audit_entry)
     db.commit()
@@ -2957,16 +3040,22 @@ async def confirm_document_validation(
 
     # Upsert known items from validated rows (non-blocking)
     try:
-        _upsert_known_items_from_validation(db, current_user, all_rows)
+        all_validated_rows = (
+            db.query(DocumentValidationRow)
+            .filter(DocumentValidationRow.document_id == document_id)
+            .order_by(DocumentValidationRow.row_index)
+            .all()
+        )
+        _upsert_known_items_from_validation(db, current_user, all_validated_rows)
         owner_id = get_organization_owner_id(current_user)
         _prune_known_items(db, owner_id)
     except Exception as e:
-        logger.warning(f"⚠️ Known items processing failed (non-critical): {e}")
+        logger.warning(f"Known items processing failed (non-critical): {e}")
 
     return {
         "document_id": document_id,
         "status": "completed",
-        "message": f"Documento validado com sucesso! {len(all_rows)} linha(s) confirmada(s).",
+        "message": f"Documento validado com sucesso! {total_row_count} linha(s) confirmada(s).",
     }
 
 
@@ -3285,34 +3374,30 @@ async def get_known_matches(
     if not doc or not verify_document_access(doc, current_user, db):
         raise HTTPException(status_code=404, detail=msg["document_not_found"])
 
-    # Get validation rows
+    owner_id = get_organization_owner_id(current_user)
+
+    # Load ALL known items for this user ONCE (single query)
+    known_items = db.query(KnownItem).filter(KnownItem.user_id == owner_id).all()
+    known_map = {item.name: item for item in known_items}
+
+    # Get only descriptions + ids from validation rows (lightweight — no full ORM load)
     rows = (
-        db.query(DocumentValidationRow)
+        db.query(DocumentValidationRow.id, DocumentValidationRow.description)
         .filter(DocumentValidationRow.document_id == document_id)
-        .order_by(DocumentValidationRow.row_index)
         .all()
     )
 
-    owner_id = get_organization_owner_id(current_user)
-
-    # For each row, try to find a matching known item
+    # Match in Python — 0 additional DB queries
     matches = {}
-    for row in rows:
-        if not row.description:
+    for row_id, description in rows:
+        if not description:
             continue
-
-        normalized = _normalize_known_item_name(row.description)
+        normalized = _normalize_known_item_name(description)
         if not normalized:
             continue
-
-        known = (
-            db.query(KnownItem)
-            .filter(KnownItem.user_id == owner_id, KnownItem.name == normalized)
-            .first()
-        )
-
+        known = known_map.get(normalized)
         if known:
-            matches[str(row.id)] = {
+            matches[str(row_id)] = {
                 "known_item_id": known.id,
                 "alias": known.alias,
                 "category": known.category,

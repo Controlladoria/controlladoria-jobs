@@ -196,6 +196,7 @@ class DocumentValidationRow(Base):
 
     __table_args__ = (
         Index("idx_validation_doc_row", "document_id", "row_index"),
+        Index("idx_validation_doc_validated", "document_id", "is_validated"),
     )
 
     def __repr__(self):
