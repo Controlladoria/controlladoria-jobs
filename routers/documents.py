@@ -958,7 +958,6 @@ async def upload_document(
         # Check monthly spreadsheet count
         max_spreadsheets = plan_features.get("max_spreadsheets_per_month")
         if max_spreadsheets is not None:
-            from datetime import datetime
             month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             spreadsheet_count = (
                 db.query(func.count(Document.id))
@@ -2630,6 +2629,9 @@ async def get_validation_rows(
     document_id: int,
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(50, ge=10, le=200, description="Rows per page"),
+    search: Optional[str] = Query(None, description="Filter by description text"),
+    category: Optional[str] = Query(None, description="Filter by category key"),
+    transaction_type: Optional[str] = Query(None, description="Filter by transaction type"),
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
@@ -2648,16 +2650,25 @@ async def get_validation_rows(
             detail="Documento não está pendente de validação.",
         )
 
-    # Get total counts (lightweight queries)
+    # Build base filter
+    base_filter = [DocumentValidationRow.document_id == document_id]
+    if search:
+        base_filter.append(DocumentValidationRow.description.ilike(f"%{search}%"))
+    if category:
+        base_filter.append(DocumentValidationRow.category == category)
+    if transaction_type:
+        base_filter.append(DocumentValidationRow.transaction_type == transaction_type)
+
+    # Get total counts with filters applied
     total_rows = (
         db.query(func.count(DocumentValidationRow.id))
-        .filter(DocumentValidationRow.document_id == document_id)
+        .filter(*base_filter)
         .scalar()
     )
     validated_count = (
         db.query(func.count(DocumentValidationRow.id))
         .filter(
-            DocumentValidationRow.document_id == document_id,
+            *base_filter,
             DocumentValidationRow.is_validated == True,
         )
         .scalar()
@@ -2666,10 +2677,10 @@ async def get_validation_rows(
     total_pages = max(1, (total_rows + page_size - 1) // page_size)
     offset = (page - 1) * page_size
 
-    # Paginated query
+    # Paginated query with filters
     rows = (
         db.query(DocumentValidationRow)
-        .filter(DocumentValidationRow.document_id == document_id)
+        .filter(*base_filter)
         .order_by(DocumentValidationRow.row_index)
         .offset(offset)
         .limit(page_size)
