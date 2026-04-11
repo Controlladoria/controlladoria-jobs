@@ -66,70 +66,66 @@ class CashFlowCalculator:
     """
 
     # Operating activity categories (for direct method)
+    # Includes both V1 legacy names and V2 Plano de Contas names
     OPERATING_INFLOW_CATEGORIES = {
-        "sales",
-        "services",
-        "other_income",
-        "interest_income",
-        "financial_income",
+        # V1 legacy
+        "sales", "services", "other_income", "interest_income", "financial_income",
+        # V2 Receita Bruta
+        "receita_vendas_produtos", "receita_servicos", "receita_locacao",
+        "receita_comissoes", "receita_contratos_recorrentes",
+        # V2 Receita Financeira / Outras
+        "receita_financeira", "juros_ativos", "descontos_obtidos",
+        "recuperacao_despesas", "outras_receitas_eventuais",
     }
 
     OPERATING_OUTFLOW_CATEGORIES = {
-        "cogs",
-        "cost_of_services",
-        "salaries",
-        "payroll",
-        "rent",
-        "utilities",
-        "electricity",
-        "water",
-        "phone",
-        "internet",
-        "office_supplies",
-        "marketing",
-        "advertising",
-        "commissions",
-        "professional_services",
-        "accounting_services",
-        "legal_services",
-        "insurance",
-        "maintenance",
-        "travel",
-        "freight_out",
-        "sales_tax_icms",
-        "sales_tax_iss",
-        "sales_tax_pis",
-        "sales_tax_cofins",
+        # V1 legacy
+        "cogs", "cost_of_services", "salaries", "payroll", "rent", "utilities",
+        "electricity", "water", "phone", "internet", "office_supplies",
+        "marketing", "advertising", "commissions", "professional_services",
+        "accounting_services", "legal_services", "insurance", "maintenance",
+        "travel", "freight_out",
+        "sales_tax_icms", "sales_tax_iss", "sales_tax_pis", "sales_tax_cofins",
+        # V2 Custos Variáveis
+        "cmv", "csp", "materia_prima", "insumos", "comissoes_sobre_vendas",
+        "salarios_producao", "encargos_sociais_producao", "energia_producao",
+        "manutencao_equipamentos_producao",
+        # V2 Deduções
+        "impostos_sobre_vendas", "devolucoes", "descontos_concedidos",
+        # V2 Despesas Administrativas
+        "salarios_administrativos", "pro_labore", "encargos_sociais_administrativos",
+        "aluguel", "condominio", "agua_energia", "material_escritorio",
+        "honorarios_contabeis", "sistemas_softwares", "telefonia_internet",
+        # V2 Despesas Comerciais
+        "marketing_publicidade", "propaganda_digital", "comissao_vendas",
+        "fretes", "representantes_comerciais",
+        # V2 Despesas Financeiras
+        "juros_passivos", "tarifas_bancarias", "iof", "multas_encargos",
+        # V2 Tributos
+        "irpj", "csll", "simples_nacional", "iptu", "taxas_municipais",
+        # V2 Outras Despesas
+        "perdas", "indenizacoes_pagas", "doacoes", "provisoes",
     }
 
     # Investing activity categories
     INVESTING_OUTFLOW_CATEGORIES = {
-        "purchase_equipment",
-        "purchase_vehicle",
-        "purchase_property",
-        "purchase_software",
-        "investments",
+        "purchase_equipment", "purchase_vehicle", "purchase_property",
+        "purchase_software", "investments",
     }
 
     INVESTING_INFLOW_CATEGORIES = {
-        "sale_equipment",
-        "sale_vehicle",
-        "sale_property",
-        "investment_income",
+        "sale_equipment", "sale_vehicle", "sale_property", "investment_income",
+        # V2
+        "venda_imobilizado", "indenizacoes_recebidas",
     }
 
     # Financing activity categories
     FINANCING_INFLOW_CATEGORIES = {
-        "loan_received",
-        "capital_contribution",
-        "capital_increase",
+        "loan_received", "capital_contribution", "capital_increase",
     }
 
     FINANCING_OUTFLOW_CATEGORIES = {
-        "loan_payment",
-        "interest_expense",
-        "dividends_paid",
-        "capital_withdrawal",
+        "loan_payment", "interest_expense", "dividends_paid", "capital_withdrawal",
     }
 
     def __init__(self, db: Session, user_id: int, org_id: Optional[int] = None):

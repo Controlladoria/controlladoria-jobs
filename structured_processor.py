@@ -553,6 +553,11 @@ class StructuredDocumentProcessor:
             else:
                 raise ValueError(f"Unsupported file type: {extension}")
 
+            # Post-extraction: enforce category→transaction_type consistency
+            # The AI prompt instructs correct mapping, but we enforce it
+            # programmatically to guarantee Plano de Contas compliance.
+            self._enforce_category_types(result)
+
             return result
 
         finally:
@@ -562,6 +567,67 @@ class StructuredDocumentProcessor:
                     Path(temp_file.name).unlink(missing_ok=True)
                 except Exception as e:
                     logger.warning(f"Failed to delete temp file {temp_file.name}: {e}")
+
+    def _enforce_category_types(self, result: dict) -> None:
+        """Enforce category→transaction_type consistency per Plano de Contas.
+
+        Mutates the extracted_data in-place. If a category is known (e.g. 'insumos'),
+        the transaction_type is forced to match its nature ('custo'), regardless of
+        what the AI returned.
+        """
+        from accounting.categories import enforce_category_type
+
+        extracted = result.get("extracted_data")
+        if extracted is None:
+            return
+
+        # Document-level enforcement
+        doc_cat = getattr(extracted, "category", None)
+        doc_type = getattr(extracted, "transaction_type", None)
+        if doc_cat and doc_type:
+            corrected = enforce_category_type(doc_cat, doc_type)
+            if corrected != doc_type:
+                logger.info(
+                    f"Category enforcement: document category='{doc_cat}' "
+                    f"type '{doc_type}' → '{corrected}'"
+                )
+                extracted.transaction_type = corrected
+
+        # Line items enforcement
+        line_items = getattr(extracted, "line_items", None)
+        if line_items:
+            for item in line_items:
+                item_cat = item.get("category") if isinstance(item, dict) else getattr(item, "category", None)
+                item_type = item.get("transaction_type") if isinstance(item, dict) else getattr(item, "transaction_type", None)
+                if item_cat and item_type:
+                    corrected = enforce_category_type(item_cat, item_type)
+                    if corrected != item_type:
+                        logger.debug(
+                            f"Category enforcement: line_item category='{item_cat}' "
+                            f"type '{item_type}' → '{corrected}'"
+                        )
+                        if isinstance(item, dict):
+                            item["transaction_type"] = corrected
+                        else:
+                            item.transaction_type = corrected
+
+        # Transactions (multi-row ledgers) enforcement
+        transactions = getattr(extracted, "transactions", None)
+        if transactions:
+            for txn in transactions:
+                txn_cat = txn.get("category") if isinstance(txn, dict) else getattr(txn, "category", None)
+                txn_type = txn.get("transaction_type") if isinstance(txn, dict) else getattr(txn, "transaction_type", None)
+                if txn_cat and txn_type:
+                    corrected = enforce_category_type(txn_cat, txn_type)
+                    if corrected != txn_type:
+                        logger.debug(
+                            f"Category enforcement: transaction category='{txn_cat}' "
+                            f"type '{txn_type}' → '{corrected}'"
+                        )
+                        if isinstance(txn, dict):
+                            txn["transaction_type"] = corrected
+                        else:
+                            txn.transaction_type = corrected
 
     def _process_image(self, image_path: Path) -> dict:
         """Process a single image file"""
@@ -842,36 +908,58 @@ class StructuredDocumentProcessor:
 
                     # Override transaction types from filename/column context
                     # AI may not correctly detect income vs expense from Excel headers
+                    #
+                    # IMPORTANT: When file has MULTIPLE sheets (e.g. Recebimentos + Pagamentos),
+                    # each sheet may have a different type. We detect type PER SHEET and only
+                    # override transactions from that sheet. If we detect BOTH income and expense
+                    # signals, we skip the global override entirely (AI already assigned per-row).
                     original_name = getattr(self, '_original_filename', '') or ''
                     fn_lower = original_name.lower() if original_name else excel_path.name.lower()
-                    primary_df = max(all_dfs, key=lambda x: len(x[1]))[1]
-                    col_str = " ".join(str(c).lower() for c in primary_df.columns)
-                    context_str = fn_lower + " " + col_str
 
                     _income_signals = ["recebimento", "receita", "faturamento", "total recebido", "valor recebido"]
                     _expense_signals = ["pagamento", "despesa", "compra", "total pago", "valor pago"]
-                    detected_type = None
-                    if any(s in context_str for s in _income_signals):
-                        detected_type = "receita"
-                    elif any(s in context_str for s in _expense_signals):
-                        detected_type = "despesa"
-                    # Also check cliente vs fornecedor in columns
-                    if detected_type is None:
-                        if "cliente" in col_str and "fornecedor" not in col_str:
-                            detected_type = "receita"
-                        elif "fornecedor" in col_str and "cliente" not in col_str:
-                            detected_type = "despesa"
 
-                    if detected_type and isinstance(structured_data, FinancialDocument):
-                        # Override document-level type
-                        if structured_data.transaction_type != detected_type:
-                            logger.debug(f"Overriding AI transaction_type '{structured_data.transaction_type}' -> '{detected_type}' from context")
-                            structured_data.transaction_type = detected_type
-                        # Override transaction-level types if they all have the wrong type
-                        if structured_data.transactions:
-                            for txn in structured_data.transactions:
-                                if not txn.transaction_type or txn.transaction_type != detected_type:
-                                    txn.transaction_type = detected_type
+                    # Build per-sheet type detection
+                    sheet_types = {}
+                    for sheet_name, df in all_dfs:
+                        sheet_lower = sheet_name.lower()
+                        col_str = " ".join(str(c).lower() for c in df.columns)
+                        context = sheet_lower + " " + col_str
+
+                        sheet_type = None
+                        if any(s in context for s in _income_signals):
+                            sheet_type = "receita"
+                        elif any(s in context for s in _expense_signals):
+                            sheet_type = "despesa"
+                        elif "cliente" in col_str and "fornecedor" not in col_str:
+                            sheet_type = "receita"
+                        elif "fornecedor" in col_str and "cliente" not in col_str:
+                            sheet_type = "despesa"
+
+                        if sheet_type:
+                            sheet_types[sheet_name] = sheet_type
+
+                    has_income_sheets = "receita" in sheet_types.values()
+                    has_expense_sheets = "despesa" in sheet_types.values()
+                    has_mixed_sheets = has_income_sheets and has_expense_sheets
+
+                    if has_mixed_sheets:
+                        # File has both income and expense sheets — trust AI's per-transaction type
+                        logger.debug(
+                            f"Multi-sheet file with mixed types (sheets: {sheet_types}). "
+                            f"Skipping global type override — AI assigned types per row."
+                        )
+                    elif sheet_types:
+                        # All sheets same type (or only one sheet has signal) — safe to override
+                        detected_type = list(sheet_types.values())[0]
+                        if detected_type and isinstance(structured_data, FinancialDocument):
+                            if structured_data.transaction_type != detected_type:
+                                logger.debug(f"Overriding AI transaction_type '{structured_data.transaction_type}' -> '{detected_type}' from context")
+                                structured_data.transaction_type = detected_type
+                            if structured_data.transactions:
+                                for txn in structured_data.transactions:
+                                    if not txn.transaction_type or txn.transaction_type != detected_type:
+                                        txn.transaction_type = detected_type
 
                     # Override document_type: Excel spreadsheets with multiple rows → transaction_ledger
                     if isinstance(structured_data, FinancialDocument) and structured_data.document_type == "statement":
@@ -1085,26 +1173,72 @@ class StructuredDocumentProcessor:
         chunk_prompt = self._get_excel_chunk_prompt()
 
         # Process chunk — runs in thread pool
+        # Process chunk — runs in thread pool, with row count validation and retry
+        MAX_CHUNK_RETRIES = 2  # retry up to 2 times if AI drops rows
+
         def process_chunk(chunk_info):
             idx, sheet, chunk_text, provider, row_start, row_end, total = chunk_info
-            logger.debug(f"  Chunk {idx}: sheet '{sheet}' rows {row_start}-{row_end} of {total} (provider: {provider})")
+            expected_rows = row_end - row_start + 1
+            logger.debug(f"  Chunk {idx}: sheet '{sheet}' rows {row_start}-{row_end} of {total} (provider: {provider}, expected {expected_rows} rows)")
 
             # Set thread-local provider so _call_with_failover starts with it
             original = self.ai_provider
             self.ai_provider = provider
             # Use the short chunk prompt instead of the massive invoice prompt
             self._thread_local._chunk_prompt = chunk_prompt
+
+            best_transactions = []
             try:
-                result = self._extract_structured_data_from_excel(chunk_text)
-                transactions = []
-                if isinstance(result, FinancialDocument) and result.transactions:
-                    transactions = list(result.transactions)
-                elif hasattr(result, "transactions") and result.transactions:
-                    transactions = list(result.transactions)
-                return idx, transactions, None
+                for attempt in range(1 + MAX_CHUNK_RETRIES):
+                    try:
+                        result = self._extract_structured_data_from_excel(chunk_text)
+                        transactions = []
+                        if isinstance(result, FinancialDocument) and result.transactions:
+                            transactions = list(result.transactions)
+                        elif hasattr(result, "transactions") and result.transactions:
+                            transactions = list(result.transactions)
+
+                        # Keep the best attempt (most rows extracted)
+                        if len(transactions) > len(best_transactions):
+                            best_transactions = transactions
+
+                        # Validate row count — AI often drops rows
+                        if len(transactions) >= expected_rows:
+                            break
+                        elif len(transactions) >= expected_rows * 0.9:
+                            logger.debug(
+                                f"  Chunk {idx}: got {len(transactions)}/{expected_rows} rows "
+                                f"(>=90%, accepting)"
+                            )
+                            break
+                        else:
+                            if attempt < MAX_CHUNK_RETRIES:
+                                logger.warning(
+                                    f"  Chunk {idx}: AI returned only {len(transactions)}/{expected_rows} rows "
+                                    f"(attempt {attempt+1}), retrying..."
+                                )
+                                if attempt == 0:
+                                    chunk_text += (
+                                        f"\n\nCRITICAL REMINDER: The data above has EXACTLY {expected_rows} rows. "
+                                        f"Your previous response only had {len(transactions)} transactions. "
+                                        f"You MUST output EXACTLY {expected_rows} transactions. "
+                                        f"Do NOT skip ANY row, even if they look like duplicates or subtotals."
+                                    )
+                            else:
+                                logger.warning(
+                                    f"  Chunk {idx}: best attempt got {len(best_transactions)}/{expected_rows} rows "
+                                    f"after {attempt+1} attempts"
+                                )
+                    except Exception as inner_e:
+                        if attempt < MAX_CHUNK_RETRIES:
+                            logger.warning(f"  Chunk {idx} attempt {attempt+1} failed: {inner_e}, retrying...")
+                        else:
+                            raise inner_e
+
+                return idx, best_transactions, None
             except Exception as e:
-                logger.warning(f"  Chunk {idx} failed: {e}")
-                return idx, [], e
+                logger.warning(f"  Chunk {idx} failed after all attempts: {e}")
+                return idx, best_transactions if best_transactions else [], e
             finally:
                 self.ai_provider = original
                 self._thread_local._chunk_prompt = None  # Clear so non-chunk calls use normal prompt
@@ -1147,8 +1281,31 @@ class StructuredDocumentProcessor:
 
         # Merge in original chunk order (important for row ordering)
         all_transactions = []
+        total_expected = sum(c[5] - c[4] + 1 for c in chunks)
         for i in sorted(all_results.keys()):
             all_transactions.extend(all_results[i])
+
+        # Log row count summary for diagnostics
+        if all_transactions:
+            coverage = len(all_transactions) / total_expected * 100 if total_expected else 0
+            logger.info(
+                f"  Chunking complete: {len(all_transactions)}/{total_expected} rows extracted "
+                f"({coverage:.1f}% coverage) from {len(chunks)} chunks"
+            )
+            if coverage < 90:
+                logger.warning(
+                    f"  ⚠️ Low extraction coverage ({coverage:.1f}%). "
+                    f"AI may have dropped rows. Per-chunk breakdown:"
+                )
+                for c in chunks:
+                    c_idx = c[0]
+                    c_expected = c[5] - c[4] + 1
+                    c_got = len(all_results.get(c_idx, []))
+                    if c_got < c_expected:
+                        logger.warning(
+                            f"    Chunk {c_idx} ({c[1]} rows {c[4]}-{c[5]}): "
+                            f"got {c_got}/{c_expected} rows (missing {c_expected - c_got})"
+                        )
 
         if not all_transactions:
             # All chunks failed — return empty FinancialDocument so caller hits pandas fallback
@@ -1163,7 +1320,7 @@ class StructuredDocumentProcessor:
         )
         total_expense = sum(
             t.amount for t in all_transactions
-            if t.transaction_type in ("expense", "despesa")
+            if t.transaction_type in ("expense", "despesa", "custo", "deducao", "investimento", "perda")
         )
 
         dates = [t.date for t in all_transactions if t.date]

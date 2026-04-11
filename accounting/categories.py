@@ -1035,3 +1035,46 @@ ADMIN_EXPENSE_CATEGORIES = FIXED_EXPENSE_ADMIN_CATEGORIES
 
 # All valid category names (V2 + aliases)
 ALL_CATEGORY_NAMES = list(DRE_CATEGORIES.keys()) + list(CATEGORY_ALIASES.keys())
+
+
+# ============================================================================
+# CATEGORY → TRANSACTION TYPE ENFORCEMENT (Plano de Contas compliance)
+# ============================================================================
+
+# Build lookup: category_name → nature (Receita/Deducao/Custo/Despesa)
+CATEGORY_TO_NATURE: Dict[str, str] = {
+    cat_name: cat_info["nature"]
+    for cat_name, cat_info in DRE_CATEGORIES.items()
+    if "nature" in cat_info
+}
+
+# Map nature to the canonical transaction_type
+NATURE_TO_TRANSACTION_TYPE: Dict[str, str] = {
+    "Receita": "receita",
+    "Deducao": "deducao",
+    "Custo": "custo",
+    "Despesa": "despesa",
+}
+
+
+def enforce_category_type(category: str, transaction_type: str) -> str:
+    """Return the correct transaction_type for the given category.
+
+    If category is a known V2 category (or resolves to one via aliases),
+    override transaction_type to match the Plano de Contas nature.
+    Otherwise return transaction_type unchanged.
+
+    Examples:
+        enforce_category_type("insumos", "despesa")   → "custo"
+        enforce_category_type("cmv", "expense")        → "custo"
+        enforce_category_type("aluguel", "custo")      → "despesa"
+        enforce_category_type("unknown_cat", "despesa") → "despesa"
+    """
+    if not category:
+        return transaction_type
+
+    resolved = resolve_category_name(category)
+    nature = CATEGORY_TO_NATURE.get(resolved)
+    if nature:
+        return NATURE_TO_TRANSACTION_TYPE.get(nature, transaction_type)
+    return transaction_type
