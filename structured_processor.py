@@ -849,11 +849,18 @@ class StructuredDocumentProcessor:
             logger.debug(f"Found {len(sheet_names)} sheet(s): {sheet_names}")
 
             # Read ALL sheets and combine into one text for AI
+            # Only include sheets that look like transaction ledgers (skip lookup tables,
+            # category lists, etc.) and clean each sheet before processing.
             all_dfs = []
             for sheet_name in sheet_names:
                 df = pd.read_excel(excel_path, sheet_name=sheet_name)
-                if len(df) > 0:
-                    all_dfs.append((sheet_name, df))
+                df = self._clean_dataframe(df)
+                if len(df) == 0:
+                    continue
+                if not self._is_transaction_ledger(df):
+                    logger.debug(f"Skipping non-transaction sheet '{sheet_name}' (columns: {list(df.columns)[:4]})")
+                    continue
+                all_dfs.append((sheet_name, df))
 
             if not all_dfs:
                 return {
@@ -979,14 +986,69 @@ class StructuredDocumentProcessor:
             except Exception as e:
                 logger.warning(f"AI extraction failed ({e}), trying pandas fallback...")
 
-            # FALLBACK: Use pandas-based ledger parsing
-            # Use the first sheet with the most rows for ledger detection
-            primary_df = max(all_dfs, key=lambda x: len(x[1]))[1]
-            is_ledger = self._is_transaction_ledger(primary_df)
+            # FALLBACK: Use pandas-based ledger parsing for ALL transaction sheets.
+            # Process each sheet individually and merge results, so multi-sheet files
+            # (e.g. Recebimentos + Pagamentos) don't silently drop the smaller sheet.
+            ledger_sheets = [(name, df) for name, df in all_dfs if self._is_transaction_ledger(df)]
 
-            if is_ledger:
-                logger.debug(f"Fallback: pandas ledger parsing")
-                structured_data = self._process_excel_as_ledger(primary_df, excel_path)
+            if ledger_sheets:
+                logger.debug(
+                    f"Fallback: pandas ledger parsing for {len(ledger_sheets)} sheet(s): "
+                    f"{[n for n, _ in ledger_sheets]}"
+                )
+                per_sheet_results = []
+                for sheet_name, df in ledger_sheets:
+                    result = self._process_excel_as_ledger(df, excel_path)
+                    if isinstance(result, TransactionLedger) and result.transactions:
+                        per_sheet_results.append(result)
+
+                if not per_sheet_results:
+                    structured_data = TransactionLedger(
+                        file_name=excel_path.name,
+                        total_transactions=0,
+                        date_range=DateRangeSummary(),
+                    )
+                elif len(per_sheet_results) == 1:
+                    structured_data = per_sheet_results[0]
+                else:
+                    # Merge all sheets into one ledger
+                    all_txns = []
+                    for r in per_sheet_results:
+                        all_txns.extend(r.transactions)
+                    total_income = sum((r.total_income for r in per_sheet_results), Decimal("0"))
+                    total_expense = sum((r.total_expense for r in per_sheet_results), Decimal("0"))
+                    starts = [r.date_range.start_date for r in per_sheet_results if r.date_range and r.date_range.start_date]
+                    ends = [r.date_range.end_date for r in per_sheet_results if r.date_range and r.date_range.end_date]
+                    date_range = DateRangeSummary(
+                        start_date=min(starts) if starts else None,
+                        end_date=max(ends) if ends else None,
+                    )
+                    cat_map = defaultdict(lambda: {"income": Decimal("0"), "expense": Decimal("0"), "count": 0})
+                    for r in per_sheet_results:
+                        for cs in r.by_category:
+                            key = "income" if cs.transaction_type == "income" else "expense"
+                            cat_map[cs.category][key] += cs.total_amount
+                            cat_map[cs.category]["count"] += cs.count
+                    merged_cats = []
+                    for cat, data in cat_map.items():
+                        dominant = "income" if data["income"] >= data["expense"] else "expense"
+                        merged_cats.append(CategorySummary(
+                            category=cat,
+                            total_amount=data[dominant],
+                            count=data["count"],
+                            transaction_type=dominant,
+                        ))
+                    merged_cats.sort(key=lambda x: x.total_amount, reverse=True)
+                    structured_data = TransactionLedger(
+                        file_name=excel_path.name,
+                        total_transactions=len(all_txns),
+                        date_range=date_range,
+                        total_income=total_income,
+                        total_expense=total_expense,
+                        net_balance=total_income - total_expense,
+                        by_category=merged_cats,
+                        transactions=all_txns,
+                    )
 
                 # AI categorization for uncategorized transactions
                 if isinstance(structured_data, TransactionLedger) and structured_data.transactions:
@@ -998,14 +1060,10 @@ class StructuredDocumentProcessor:
                         logger.warning(f"⚠️ AI categorization skipped: {e}")
 
                 # Check if fallback produced results
-                ledger_failed = False
-                if isinstance(structured_data, TransactionLedger):
-                    if structured_data.total_transactions == 0:
-                        ledger_failed = True
-                    elif (structured_data.total_income == 0 and
-                          structured_data.total_expense == 0):
-                        ledger_failed = True
-
+                ledger_failed = (
+                    structured_data.total_transactions == 0 or
+                    (structured_data.total_income == 0 and structured_data.total_expense == 0)
+                )
                 if ledger_failed:
                     logger.error(f"❌ Both AI and pandas parsing failed for {excel_path.name}")
                     return {
@@ -1016,6 +1074,7 @@ class StructuredDocumentProcessor:
                     }
             else:
                 logger.debug(f"Fallback: single document AI extraction")
+                primary_df = max(all_dfs, key=lambda x: len(x[1]))[1]
                 excel_text_single = self._dataframe_to_text(primary_df, excel_path.name)
                 structured_data = self._extract_structured_data_from_excel(excel_text_single)
 
@@ -1457,6 +1516,19 @@ class StructuredDocumentProcessor:
             return False
 
         df = df[~df.apply(is_summary_row, axis=1)]
+
+        # Remove orphan-numeric rows: rows where the only non-null value is a single number.
+        # These are SUM/totals formula cells (e.g. =SUM(E2:E36)) that have no date,
+        # description or any other context — they are not transactions.
+        def is_orphan_numeric(row):
+            non_null_vals = [val for val in row if pd.notna(val)]
+            if not non_null_vals:
+                return True
+            if len(non_null_vals) == 1 and isinstance(non_null_vals[0], (int, float)):
+                return True
+            return False
+
+        df = df[~df.apply(is_orphan_numeric, axis=1)]
 
         return df.reset_index(drop=True)
 

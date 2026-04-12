@@ -124,7 +124,9 @@ Extract numeros apenas (only numbers), remove all formatting."""
             result_text = response["output"]["message"]["content"][0]["text"]
 
         elif ai_provider == "openai":
-            client = OpenAI(api_key=api_key)
+            # max_retries=0: quota errors (insufficient_quota) are permanent — SDK's
+            # built-in retry loop burns time and adds noise without any chance of success.
+            client = OpenAI(api_key=api_key, max_retries=0)
             response = client.chat.completions.create(
                 model=model,
                 messages=[{
