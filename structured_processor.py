@@ -1985,16 +1985,16 @@ class StructuredDocumentProcessor:
                         pass
 
                 # Determine transaction type (priority: row > force_type > debit/credit > sign)
+                # When type is already known, preserve negative amounts (refunds, reversals, cancellations).
+                # Only abs() when inferring type from sign (last branch).
                 if row_type:
                     transaction_type = row_type
-                    amount = abs(amount)
                 elif force_type:
                     transaction_type = force_type
-                    amount = abs(amount)
                 elif debit_credit_type:
                     transaction_type = debit_credit_type
-                    amount = abs(amount)
                 else:
+                    # Infer type from sign — here abs() is correct since sign becomes the type
                     transaction_type = "despesa" if amount < 0 else "receita"
                     amount = abs(amount)
 

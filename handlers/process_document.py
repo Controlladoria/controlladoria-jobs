@@ -280,7 +280,8 @@ def _process_document(document_id: int, file_path: str, lambda_context=None):
 
                 doc.extracted_data_json = extracted_data.model_dump_json()
                 doc.status = DocumentStatus.PENDING_VALIDATION
-                doc.processed_date = datetime.utcnow()
+                from config import now_brazil
+                doc.processed_date = now_brazil()
 
                 # Extract department/category
                 if "category" in data_dict:

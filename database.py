@@ -7,6 +7,8 @@ import enum
 import os
 from datetime import datetime
 
+from config import now_brazil
+
 from sqlalchemy import Boolean, Column, Date, DateTime, JSON, Numeric, UniqueConstraint
 from sqlalchemy import Enum as SQLEnum
 from sqlalchemy import ForeignKey, Index, Integer, String, Text, create_engine
@@ -98,8 +100,8 @@ class Document(Base):
 
     # Timestamps
     upload_date = Column(
-        DateTime, default=datetime.utcnow, nullable=False, index=True
-    )  # Indexed for sorting
+        DateTime, default=now_brazil, nullable=False, index=True
+    )  # Indexed for sorting — Brazil timezone (UTC-3)
     processed_date = Column(DateTime, nullable=True)
 
     # CNPJ validation warning (Item 7 - warn instead of block)

@@ -5,9 +5,19 @@ Centralized settings for the application
 
 import json
 import os
+from datetime import datetime, timezone, timedelta
 from typing import List
 
 import boto3
+
+# Brazil timezone (UTC-3) — used for all timestamps visible to users.
+# São Paulo doesn't observe DST since 2019, so fixed offset is correct.
+BRT = timezone(timedelta(hours=-3))
+
+
+def now_brazil() -> datetime:
+    """Current datetime in Brazil timezone (UTC-3), timezone-aware."""
+    return datetime.now(BRT)
 from pydantic_settings import BaseSettings
 
 
