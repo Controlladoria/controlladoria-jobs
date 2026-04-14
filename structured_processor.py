@@ -1193,6 +1193,37 @@ class StructuredDocumentProcessor:
 
         logger.debug(f"  Provider rotation: {' -> '.join(weighted_providers)} (weighted by chunk size)")
 
+        # Detect the amount column from each sheet using the pandas priority logic.
+        # After AI extraction, we'll override AI-returned amounts with the exact
+        # values from the DataFrame to eliminate AI rounding errors.
+        sheet_amount_cols = {}
+        for sheet_name, df in all_dfs:
+            _amt_col = None
+            _amount_tiers = [
+                ["total recebido", "total pago", "valor total pago", "valor total recebido"],
+                ["valor pago", "valor recebido"],
+                ["valor", "value", "amount", "montante"],
+                ["total da parcela", "total", "parcela"],
+            ]
+            for tier in _amount_tiers:
+                for kw in tier:
+                    for col in df.columns:
+                        if kw in str(col).lower():
+                            _amt_col = col
+                            break
+                    if _amt_col:
+                        break
+                if _amt_col:
+                    break
+            if _amt_col is None:
+                # Fallback: largest numeric column
+                numeric_cols = df.select_dtypes(include=["float64", "int64"]).columns
+                if len(numeric_cols) > 0:
+                    _amt_col = max(numeric_cols, key=lambda c: df[c].notna().sum())
+            if _amt_col:
+                sheet_amount_cols[sheet_name] = _amt_col
+                logger.debug(f"  Sheet '{sheet_name}': amount column detected as '{_amt_col}'")
+
         # Build all chunks
         chunks = []
         chunk_index = 0
@@ -1371,6 +1402,56 @@ class StructuredDocumentProcessor:
             return FinancialDocument(
                 document_type="transaction_ledger",
             )
+
+        # ================================================================
+        # AMOUNT OVERRIDE: Replace AI-returned amounts with exact DataFrame values.
+        # AI models round/truncate decimals (e.g., 554.59 → 555, 1549.34 → 1549).
+        # Since we know the exact row positions per chunk, we can match transactions
+        # back to the original DataFrame and use the precise numeric value.
+        # ================================================================
+        if sheet_amount_cols:
+            override_count = 0
+            txn_idx = 0  # Global transaction index across all chunks
+            for chunk in sorted(chunks, key=lambda c: c[0]):
+                c_idx, c_sheet, _, _, c_row_start, c_row_end, _ = chunk
+                chunk_txns = all_results.get(c_idx, [])
+                amt_col = sheet_amount_cols.get(c_sheet)
+                if not amt_col or not chunk_txns:
+                    txn_idx += len(chunk_txns)
+                    continue
+
+                # Find the DataFrame for this sheet
+                sheet_df = None
+                for sn, sdf in all_dfs:
+                    if sn == c_sheet:
+                        sheet_df = sdf
+                        break
+                if sheet_df is None:
+                    txn_idx += len(chunk_txns)
+                    continue
+
+                # c_row_start is 1-based, DataFrame is 0-based
+                df_start = c_row_start - 1
+                df_end = c_row_end  # exclusive
+
+                # Get the exact amounts from the DataFrame for this chunk's rows
+                chunk_amounts = sheet_df[amt_col].iloc[df_start:df_end].tolist()
+
+                # Override: if AI returned same number of transactions as rows,
+                # replace amounts 1:1 (positional match)
+                if len(chunk_txns) == len(chunk_amounts):
+                    for i, txn in enumerate(chunk_txns):
+                        original_val = chunk_amounts[i]
+                        if pd.notna(original_val):
+                            exact_amount = float(original_val)
+                            if abs(exact_amount - txn.amount) > 0.001:
+                                override_count += 1
+                            txn.amount = exact_amount
+
+                txn_idx += len(chunk_txns)
+
+            if override_count > 0:
+                logger.info(f"  Amount override: corrected {override_count} amounts from DataFrame (AI rounding fix)")
 
         # Merge all chunk transactions into a single TransactionLedger
         total_income = sum(
@@ -2305,6 +2386,15 @@ CRITICAL RULES:
 3. Do NOT summarize, merge, or deduplicate rows. Extract each one individually.
 4. Do NOT skip rows that look like subtotals, totals, or duplicates — extract them too.
 
+AMOUNT COLUMN SELECTION — READ THIS CAREFULLY:
+When a spreadsheet has MULTIPLE amount columns, you MUST pick the one that represents WHAT WAS ACTUALLY PAID/RECEIVED, NOT the original invoice value. Priority order:
+  1. "Valor Total Pago", "Total Pago", "Valor Pago Total" → USE THIS (actual payment amount)
+  2. "Total Recebido", "Valor Total Recebido" → USE THIS (actual received amount)
+  3. "Valor Pago", "Valor Pago da Parcela", "Valor Recebido" → second choice
+  4. "Valor da Parcela", "Total da Parcela", "Valor Original" → AVOID (this is the invoice/installment amount, NOT what was paid — it ignores interest, fines, discounts, and partial payments)
+The difference matters: "Valor da Parcela" = R$3309.74 but "Valor Total Pago" = R$1741.41 (partial payment). You MUST use 1741.41.
+If the amount is NEGATIVE in the spreadsheet, preserve the negative sign — do NOT convert to positive. Negatives indicate refunds, reversals, or cancellations.
+
 Brazilian number format: "1.234,56" = 1234.56 (comma = decimal, period = thousands).
 Convert all amounts to standard format (period for decimal, no thousands separator).
 Dates: convert to YYYY-MM-DD (from dd/mm/yyyy).
@@ -2573,6 +2663,7 @@ Important rules for Brazilian documents:
 - **CATEGORY IS MANDATORY**: Assign a category to EVERY item and to the document. Never null. Each line_item MUST have its own "category" field.
 - Common payment methods: "pix", "boleto", "cartao_credito", "transferencia", "dinheiro"
 - **EXCEL/SPREADSHEET WITH MULTIPLE TRANSACTIONS**: If the document is an Excel spreadsheet, bank statement, or ledger with multiple transactions (one per row), use the "transactions" array (NOT "line_items"). Each transaction should have its own date, description, category, amount, transaction_type, and counterparty (supplier/client name if present in the data). If each row has a different supplier/client, capture that in the counterparty field of each transaction.
+- **AMOUNT COLUMN SELECTION**: When a spreadsheet has MULTIPLE amount columns, pick the one representing WHAT WAS ACTUALLY PAID/RECEIVED — NOT the original invoice value. Priority: "Valor Total Pago"/"Total Recebido" > "Valor Pago"/"Valor Recebido" > "Valor da Parcela". The "Parcela" is the invoice amount and ignores interest, fines, discounts, partial payments. If the value is negative, preserve the sign (refunds/reversals).
 - **INVOICES WITH PRODUCTS**: For invoices/receipts with product line items, use "line_items" array.
 - **CRITICAL - LINE ITEMS**: You MUST extract EVERY SINGLE line item from the document
   * Do NOT skip items or summarize - include ALL items even if there are many
