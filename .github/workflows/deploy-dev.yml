@@ -235,5 +235,15 @@ jobs:
             echo "Only $COUNT images, nothing to clean up"
           fi
 
+      - name: Set CloudWatch log retention (7 days)
+        run: |
+          for fn in controlladoria-worker-document-processing-dev controlladoria-worker-cleanup-files-dev controlladoria-worker-cleanup-tokens-dev controlladoria-worker-retry-documents-dev; do
+            LOG_GROUP="/aws/lambda/$fn"
+            aws logs put-retention-policy \
+              --log-group-name "$LOG_GROUP" \
+              --retention-in-days 7 \
+              --no-cli-pager 2>/dev/null || true
+          done
+
       - name: Summary
         run: echo "Dev deploy complete — image ${{ steps.build-image.outputs.image }}"
