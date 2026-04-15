@@ -1444,7 +1444,8 @@ class StructuredDocumentProcessor:
                         original_val = chunk_amounts[i]
                         if pd.notna(original_val):
                             exact_amount = float(original_val)
-                            if abs(exact_amount - txn.amount) > 0.001:
+                            current_amount = float(txn.amount) if txn.amount is not None else 0.0
+                            if abs(exact_amount - current_amount) > 0.001:
                                 override_count += 1
                             txn.amount = exact_amount
 
@@ -1454,12 +1455,13 @@ class StructuredDocumentProcessor:
                 logger.info(f"  Amount override: corrected {override_count} amounts from DataFrame (AI rounding fix)")
 
         # Merge all chunk transactions into a single TransactionLedger
+        # Use float() to avoid Decimal/float mixing issues from amount override
         total_income = sum(
-            t.amount for t in all_transactions
+            float(t.amount) for t in all_transactions
             if t.transaction_type in ("income", "receita")
         )
         total_expense = sum(
-            t.amount for t in all_transactions
+            float(t.amount) for t in all_transactions
             if t.transaction_type in ("expense", "despesa", "custo", "deducao", "investimento", "perda")
         )
 
