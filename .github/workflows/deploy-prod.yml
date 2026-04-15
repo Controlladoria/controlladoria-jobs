@@ -112,12 +112,19 @@ jobs:
             fi
           done
 
-      - name: Wait for Lambda updates
+      - name: Wait for Lambda updates and force cold start
         run: |
           for fn in controlladoria-worker-document-processing-prod controlladoria-worker-cleanup-files-prod controlladoria-worker-cleanup-tokens-prod controlladoria-worker-retry-documents-prod; do
             echo "Waiting for $fn..."
             aws lambda wait function-updated --function-name "$fn" --no-cli-pager
+
+            aws lambda update-function-configuration \
+              --function-name "$fn" \
+              --environment "{\"Variables\":{\"AWS_SSM_PREFIX\":\"/controlladoria/prod/worker/\",\"DEPLOY_SHA\":\"${{ github.sha }}\"}}" \
+              --no-cli-pager
+            aws lambda wait function-updated --function-name "$fn" --no-cli-pager
           done
+          echo "All functions updated and warm instances invalidated"
 
       - name: Ensure SQS trigger exists
         run: |
