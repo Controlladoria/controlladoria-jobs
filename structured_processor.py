@@ -1017,6 +1017,11 @@ class StructuredDocumentProcessor:
                         all_txns.extend(r.transactions)
                     total_income = sum((r.total_income for r in per_sheet_results), Decimal("0"))
                     total_expense = sum((r.total_expense for r in per_sheet_results), Decimal("0"))
+                    logger.info(
+                        f"Multi-sheet merge: {len(per_sheet_results)} sheets, "
+                        f"income={total_income}, expense={total_expense}, "
+                        f"per-sheet: {[(r.total_income, r.total_expense) for r in per_sheet_results]}"
+                    )
                     starts = [r.date_range.start_date for r in per_sheet_results if r.date_range and r.date_range.start_date]
                     ends = [r.date_range.end_date for r in per_sheet_results if r.date_range and r.date_range.end_date]
                     date_range = DateRangeSummary(
@@ -2183,8 +2188,9 @@ class StructuredDocumentProcessor:
             transactions=transactions,
         )
 
-        logger.debug(
-            f"Ledger summary - Income: {total_income}, Expense: {total_expense}, Balance: {total_income - total_expense}"
+        logger.info(
+            f"Ledger summary - Income: {total_income}, Expense: {total_expense}, Balance: {total_income - total_expense}, "
+            f"Txn count: {len(transactions)}, Negative amounts: {sum(1 for t in transactions if t.amount < 0)}"
         )
 
         # Clean up dataframe references to release file handle
