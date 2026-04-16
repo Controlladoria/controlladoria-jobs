@@ -612,6 +612,11 @@ class StructuredDocumentProcessor:
             f"Recalculated totals: income={total_income}, expense={total_expense}, "
             f"net={total_income - total_expense}, txns={len(transactions)}"
         )
+        # Verify the assignment stuck
+        logger.info(
+            f"Verify after assignment: total_expense={getattr(extracted, 'total_expense', 'N/A')}, "
+            f"total_income={getattr(extracted, 'total_income', 'N/A')}"
+        )
 
     def _enforce_category_types(self, result: dict) -> None:
         """Enforce category→transaction_type consistency per Plano de Contas.

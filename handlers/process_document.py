@@ -275,10 +275,29 @@ def _process_document(document_id: int, file_path: str, lambda_context=None):
 
                 data_dict = extracted_data.model_dump()
 
+                # Recalculate totals from actual transaction data
+                # (the processor may have corrected amounts/types after initial calculation)
+                txns = data_dict.get("transactions")
+                if txns and isinstance(txns, list) and len(txns) > 0:
+                    from decimal import Decimal
+                    recalc_income = sum(
+                        float(t.get("amount", 0) or 0) for t in txns
+                        if (t.get("transaction_type") or "").lower() in ("income", "receita")
+                    )
+                    recalc_expense = sum(
+                        float(t.get("amount", 0) or 0) for t in txns
+                        if (t.get("transaction_type") or "").lower() not in ("income", "receita")
+                    )
+                    data_dict["total_income"] = recalc_income
+                    data_dict["total_expense"] = recalc_expense
+                    data_dict["net_balance"] = recalc_income - recalc_expense
+                    data_dict["total_transactions"] = len(txns)
+                    logger.info(f"Handler recalc: income={recalc_income}, expense={recalc_expense}")
+
                 validator = FinancialValidator()
                 is_valid, errors, warnings = validator.validate_document(data_dict)
 
-                doc.extracted_data_json = extracted_data.model_dump_json()
+                doc.extracted_data_json = json.dumps(data_dict, default=str)
                 doc.status = DocumentStatus.PENDING_VALIDATION
                 from config import now_brazil
                 doc.processed_date = now_brazil()
