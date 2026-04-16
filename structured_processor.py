@@ -554,9 +554,13 @@ class StructuredDocumentProcessor:
                 raise ValueError(f"Unsupported file type: {extension}")
 
             # Post-extraction: enforce category→transaction_type consistency
-            # The AI prompt instructs correct mapping, but we enforce it
-            # programmatically to guarantee Plano de Contas compliance.
             self._enforce_category_types(result)
+
+            # Recalculate totals from actual transaction amounts.
+            # The AI often returns positive amounts for negative values (refunds, returns).
+            # The amount override from the DataFrame corrects these, but totals were
+            # computed before the override. Recalculate here to get the final correct values.
+            self._recalculate_totals(result)
 
             return result
 
@@ -567,6 +571,47 @@ class StructuredDocumentProcessor:
                     Path(temp_file.name).unlink(missing_ok=True)
                 except Exception as e:
                     logger.warning(f"Failed to delete temp file {temp_file.name}: {e}")
+
+    def _recalculate_totals(self, result: dict) -> None:
+        """Recalculate total_income, total_expense, net_balance from actual transactions.
+
+        Called after enforcement and amount overrides so totals reflect final data.
+        Handles both TransactionLedger and FinancialDocument with inner transactions.
+        """
+        extracted = result.get("extracted_data")
+        if extracted is None:
+            return
+
+        transactions = getattr(extracted, "transactions", None)
+        if not transactions or len(transactions) == 0:
+            return
+
+        total_income = Decimal("0")
+        total_expense = Decimal("0")
+
+        for txn in transactions:
+            amount = Decimal(str(getattr(txn, "amount", 0) or 0))
+            txn_type = (getattr(txn, "transaction_type", "") or "").lower().strip()
+
+            if txn_type in ("income", "receita"):
+                total_income += amount
+            else:
+                total_expense += amount
+
+        # Update the extracted data totals
+        if hasattr(extracted, "total_income"):
+            extracted.total_income = total_income
+        if hasattr(extracted, "total_expense"):
+            extracted.total_expense = total_expense
+        if hasattr(extracted, "net_balance"):
+            extracted.net_balance = total_income - total_expense
+        if hasattr(extracted, "total_transactions"):
+            extracted.total_transactions = len(transactions)
+
+        logger.info(
+            f"Recalculated totals: income={total_income}, expense={total_expense}, "
+            f"net={total_income - total_expense}, txns={len(transactions)}"
+        )
 
     def _enforce_category_types(self, result: dict) -> None:
         """Enforce category→transaction_type consistency per Plano de Contas.
