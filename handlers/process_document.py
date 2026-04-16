@@ -431,6 +431,16 @@ def _process_document(document_id: int, file_path: str, lambda_context=None):
                 if doc.retry_count >= settings.document_max_retries:
                     doc.max_retries_exhausted = True
 
+            # Final sanity check: log what we're about to commit
+            if doc.extracted_data_json:
+                import json as _j
+                _saved = _j.loads(doc.extracted_data_json)
+                logger.info(
+                    f"FINAL COMMIT: total_expense={_saved.get('total_expense')}, "
+                    f"total_income={_saved.get('total_income')}, "
+                    f"net_balance={_saved.get('net_balance')}"
+                )
+
             db.commit()
             logger.info(f"Document {document_id} processed: status={doc.status.value}")
 
