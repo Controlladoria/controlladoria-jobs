@@ -292,7 +292,7 @@ def _process_document(document_id: int, file_path: str, lambda_context=None):
                     data_dict["total_expense"] = recalc_expense
                     data_dict["net_balance"] = recalc_income - recalc_expense
                     data_dict["total_transactions"] = len(txns)
-                    logger.info(f"Handler recalc: income={recalc_income}, expense={recalc_expense}")
+                    logger.debug(f"Handler recalc: income={recalc_income}, expense={recalc_expense}")
 
                 validator = FinancialValidator()
                 is_valid, errors, warnings = validator.validate_document(data_dict)
@@ -430,16 +430,6 @@ def _process_document(document_id: int, file_path: str, lambda_context=None):
                 doc.error_message = error_msg
                 if doc.retry_count >= settings.document_max_retries:
                     doc.max_retries_exhausted = True
-
-            # Final sanity check: log what we're about to commit
-            if doc.extracted_data_json:
-                import json as _j
-                _saved = _j.loads(doc.extracted_data_json)
-                logger.info(
-                    f"FINAL COMMIT: total_expense={_saved.get('total_expense')}, "
-                    f"total_income={_saved.get('total_income')}, "
-                    f"net_balance={_saved.get('net_balance')}"
-                )
 
             db.commit()
             logger.info(f"Document {document_id} processed: status={doc.status.value}")

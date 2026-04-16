@@ -608,14 +608,9 @@ class StructuredDocumentProcessor:
         if hasattr(extracted, "total_transactions"):
             extracted.total_transactions = len(transactions)
 
-        logger.info(
+        logger.debug(
             f"Recalculated totals: income={total_income}, expense={total_expense}, "
             f"net={total_income - total_expense}, txns={len(transactions)}"
-        )
-        # Verify the assignment stuck
-        logger.info(
-            f"Verify after assignment: total_expense={getattr(extracted, 'total_expense', 'N/A')}, "
-            f"total_income={getattr(extracted, 'total_income', 'N/A')}"
         )
 
     def _enforce_category_types(self, result: dict) -> None:
@@ -1067,10 +1062,9 @@ class StructuredDocumentProcessor:
                         all_txns.extend(r.transactions)
                     total_income = sum((r.total_income for r in per_sheet_results), Decimal("0"))
                     total_expense = sum((r.total_expense for r in per_sheet_results), Decimal("0"))
-                    logger.info(
+                    logger.debug(
                         f"Multi-sheet merge: {len(per_sheet_results)} sheets, "
-                        f"income={total_income}, expense={total_expense}, "
-                        f"per-sheet: {[(r.total_income, r.total_expense) for r in per_sheet_results]}"
+                        f"income={total_income}, expense={total_expense}"
                     )
                     starts = [r.date_range.start_date for r in per_sheet_results if r.date_range and r.date_range.start_date]
                     ends = [r.date_range.end_date for r in per_sheet_results if r.date_range and r.date_range.end_date]
@@ -1438,19 +1432,7 @@ class StructuredDocumentProcessor:
                 f"({coverage:.1f}% coverage) from {len(chunks)} chunks"
             )
             if coverage < 90:
-                logger.warning(
-                    f"  ⚠️ Low extraction coverage ({coverage:.1f}%). "
-                    f"AI may have dropped rows. Per-chunk breakdown:"
-                )
-                for c in chunks:
-                    c_idx = c[0]
-                    c_expected = c[5] - c[4] + 1
-                    c_got = len(all_results.get(c_idx, []))
-                    if c_got < c_expected:
-                        logger.warning(
-                            f"    Chunk {c_idx} ({c[1]} rows {c[4]}-{c[5]}): "
-                            f"got {c_got}/{c_expected} rows (missing {c_expected - c_got})"
-                        )
+                logger.warning(f"  Low extraction coverage ({coverage:.1f}%)")
 
         if not all_transactions:
             # All chunks failed — return empty FinancialDocument so caller hits pandas fallback
@@ -1507,7 +1489,7 @@ class StructuredDocumentProcessor:
                 txn_idx += len(chunk_txns)
 
             if override_count > 0:
-                logger.info(f"  Amount override: corrected {override_count} amounts from DataFrame (AI rounding fix)")
+                logger.debug(f"  Amount override: corrected {override_count} amounts from DataFrame")
 
         # Merge all chunk transactions into a single TransactionLedger
         total_income = sum(
@@ -2238,9 +2220,8 @@ class StructuredDocumentProcessor:
             transactions=transactions,
         )
 
-        logger.info(
-            f"Ledger summary - Income: {total_income}, Expense: {total_expense}, Balance: {total_income - total_expense}, "
-            f"Txn count: {len(transactions)}, Negative amounts: {sum(1 for t in transactions if t.amount < 0)}"
+        logger.debug(
+            f"Ledger summary - Income: {total_income}, Expense: {total_expense}, Balance: {total_income - total_expense}"
         )
 
         # Clean up dataframe references to release file handle
