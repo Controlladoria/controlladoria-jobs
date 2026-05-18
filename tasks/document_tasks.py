@@ -11,7 +11,7 @@ from pathlib import Path
 from celery import Task
 
 from celery_app import celery_app
-from database import Document, DocumentStatus, SessionLocal
+from database import Document, DocumentStatus, Organization, SessionLocal, User
 from storage.s3_service import s3_storage
 from structured_processor import StructuredDocumentProcessor
 
@@ -90,11 +90,34 @@ def process_document_async(self, document_id: int, file_path: str, user_id: int)
             processing_file_path = file_path
             logger.info(f"📂 Using local file: {processing_file_path}")
 
+        # Build user/org context for AI extraction
+        user_company_info = None
+        try:
+            user = self.db.query(User).filter(User.id == doc.user_id).first()
+            if user:
+                org = None
+                if doc.organization_id:
+                    org = self.db.query(Organization).filter(Organization.id == doc.organization_id).first()
+                if org:
+                    user_company_info = {
+                        "company_name": org.trade_name or org.company_name,
+                        "legal_name": org.company_name,
+                        "cnpj": org.cnpj,
+                    }
+                else:
+                    user_company_info = {
+                        "company_name": user.company_name or user.full_name,
+                        "legal_name": user.full_name,
+                        "cnpj": user.cnpj,
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to load user/org context: {e}")
+
         # Process document with AI
         try:
             logger.info(f"🤖 Starting AI processing...")
             processor = StructuredDocumentProcessor()
-            result = processor.process_document(processing_file_path)
+            result = processor.process_document(processing_file_path, user_company_info=user_company_info)
 
             if result["status"] == "success":
                 # Save extracted data to database

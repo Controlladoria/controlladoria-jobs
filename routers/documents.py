@@ -547,6 +547,7 @@ def _batch_categorize_uncategorized_rows(db: Session, doc: "Document", processor
     and batch-categorize them using AI.
     """
     import json
+    import re
 
     UNCATEGORIZED = {"nao_categorizado", "uncategorized", ""}
     uncategorized_rows = (
@@ -554,6 +555,7 @@ def _batch_categorize_uncategorized_rows(db: Session, doc: "Document", processor
         .filter(
             DocumentValidationRow.document_id == doc.id,
             DocumentValidationRow.category.in_(list(UNCATEGORIZED)),
+            DocumentValidationRow.transaction_type != "transferencia",
         )
         .all()
     )
@@ -577,16 +579,36 @@ def _batch_categorize_uncategorized_rows(db: Session, doc: "Document", processor
     logger.info(f"🤖 Post-processing: categorizing {len(unique_descriptions)} uncategorized descriptions for doc {doc.id}")
 
     CATEGORIES_TEXT = (
-        "RECEITA: receita_vendas_produtos, receita_servicos, receita_locacao, receita_comissoes, receita_contratos_recorrentes\n"
-        "DEDUÇÕES: impostos_sobre_vendas, devolucoes, descontos_concedidos\n"
-        "CUSTOS VARIÁVEIS: cmv, csp, materia_prima, insumos, comissoes_sobre_vendas\n"
-        "CUSTOS FIXOS PRODUÇÃO: salarios_producao, encargos_sociais_producao, energia_producao, manutencao_equipamentos_producao\n"
-        "DESPESAS ADMIN: salarios_administrativos, pro_labore, encargos_sociais_administrativos, aluguel, condominio, agua_energia, material_escritorio, honorarios_contabeis, sistemas_softwares, telefonia_internet\n"
-        "DESPESAS COMERCIAIS: marketing_publicidade, propaganda_digital, comissao_vendas, fretes, representantes_comerciais\n"
-        "FINANCEIRO: receita_financeira, juros_ativos, descontos_obtidos, juros_passivos, tarifas_bancarias, iof, multas_encargos\n"
-        "TRIBUTOS: irpj, csll, simples_nacional, iptu, taxas_municipais\n"
-        "OUTRAS: recuperacao_despesas, venda_imobilizado, indenizacoes_recebidas, outras_receitas_eventuais, perdas, indenizacoes_pagas, doacoes, provisoes, depreciacao, amortizacao, outras_despesas_operacionais\n"
-        "FALLBACK: nao_categorizado (ONLY as absolute last resort)"
+        "RECEITA: receita_vendas_produtos (Receita de Vendas), receita_servicos (Receita de Serviços), "
+        "receita_locacao (Receita de Locação), receita_comissoes (Receita de Comissões), "
+        "receita_contratos_recorrentes (Receita Recorrente/Assinaturas)\n"
+        "DEDUÇÕES: impostos_sobre_vendas (Impostos s/ Vendas), devolucoes (Devoluções), "
+        "descontos_concedidos (Descontos Concedidos)\n"
+        "CUSTOS VARIÁVEIS: cmv (CMV/Custo Mercadoria), csp (CSP/Custo Serviço), "
+        "materia_prima (Matéria-Prima), insumos (Insumos), comissoes_sobre_vendas (Comissões s/ Vendas)\n"
+        "CUSTOS FIXOS PRODUÇÃO: salarios_producao (Salários Produção), "
+        "encargos_sociais_producao (Encargos Sociais Produção), energia_producao (Energia Produção), "
+        "manutencao_equipamentos_producao (Manutenção Equipamentos)\n"
+        "DESPESAS ADMIN: salarios_administrativos (Salários Adm), pro_labore (Pró-Labore), "
+        "encargos_sociais_administrativos (Encargos Sociais Adm), aluguel (Aluguel), "
+        "condominio (Condomínio), agua_energia (Água/Energia/Luz), "
+        "material_escritorio (Material Escritório), honorarios_contabeis (Honorários Contábeis), "
+        "sistemas_softwares (Sistemas/Softwares/Assinaturas), telefonia_internet (Telefone/Internet)\n"
+        "DESPESAS COMERCIAIS: marketing_publicidade (Marketing/Publicidade), "
+        "propaganda_digital (Anúncios Digitais/Google/Meta), comissao_vendas (Comissão de Vendas), "
+        "fretes (Fretes/Logística), representantes_comerciais (Representantes Comerciais)\n"
+        "FINANCEIRO: receita_financeira (Receita Financeira), juros_ativos (Juros Recebidos), "
+        "descontos_obtidos (Descontos Obtidos), juros_passivos (Juros Pagos/Financiamentos), "
+        "tarifas_bancarias (Tarifas Bancárias/TARIFA/Taxa Bancária/Manutenção Conta), "
+        "iof (IOF), multas_encargos (Multas/Encargos/Mora)\n"
+        "TRIBUTOS: irpj (IRPJ), csll (CSLL), simples_nacional (Simples Nacional/DAS), "
+        "iptu (IPTU), taxas_municipais (Taxas Municipais/Alvarás)\n"
+        "OUTRAS: recuperacao_despesas (Recuperação de Despesas), venda_imobilizado (Venda de Ativo), "
+        "indenizacoes_recebidas (Indenizações Recebidas), outras_receitas_eventuais (Outras Receitas), "
+        "perdas (Perdas), indenizacoes_pagas (Indenizações Pagas), doacoes (Doações), "
+        "provisoes (Provisões), depreciacao (Depreciação), amortizacao (Amortização), "
+        "outras_despesas_operacionais (Outras Despesas Operacionais)\n"
+        "FALLBACK: nao_categorizado — ONLY if absolutely impossible to categorize"
     )
 
     VALID_CATEGORIES = {
@@ -605,8 +627,6 @@ def _batch_categorize_uncategorized_rows(db: Session, doc: "Document", processor
         "nao_categorizado",
     }
 
-    import re
-
     BATCH_SIZE = 80
     description_to_category = {}
 
@@ -618,31 +638,18 @@ def _batch_categorize_uncategorized_rows(db: Session, doc: "Document", processor
             "You are a Brazilian accounting assistant. Categorize each transaction description below "
             "using EXACTLY one category key from the V2 Plano de Contas list.\n"
             "These are from bank statements and financial documents. Try your BEST to assign a real category.\n"
-            "Common patterns: PIX/transferência → analyze context, tarifa → tarifas_bancarias, "
-            "compra com cartão → analyze what was bought, saldo → ignore (use nao_categorizado).\n\n"
-            f"V2 categories:\n{CATEGORIES_TEXT}\n\n"
+            "Key hints: any 'TARIFA' or 'TAXA' from a bank → tarifas_bancarias; "
+            "PIX/TED/DOC that is not a transfer to self → analyze context to determine income or expense type; "
+            "salary/folha → salarios_administrativos or salarios_producao; "
+            "saldo/extrato/resumo → nao_categorizado.\n\n"
+            f"V2 categories (key: description):\n{CATEGORIES_TEXT}\n\n"
             "Return ONLY a valid JSON object mapping each description exactly as given to its category key. "
             "No markdown, no explanation.\n"
             f"Descriptions: {descriptions_json}"
         )
 
         try:
-            if processor.ai_provider == "openai":
-                response = processor._active_client.chat.completions.create(
-                    model=processor.openai_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_completion_tokens=4000,
-                    store=False,
-                )
-                raw = response.choices[0].message.content or "{}"
-            else:
-                response = processor._active_client.messages.create(
-                    model=processor.anthropic_model,
-                    max_tokens=4000,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                raw = response.content[0].text if response.content else "{}"
-
+            raw = processor.call_text_prompt(prompt)
             raw = raw.strip()
             if raw.startswith("```"):
                 raw = re.sub(r"^```[a-z]*\n?", "", raw)
@@ -666,6 +673,127 @@ def _batch_categorize_uncategorized_rows(db: Session, doc: "Document", processor
 
     if updated_count:
         logger.info(f"✅ Post-processing updated {updated_count} rows with AI categories for doc {doc.id}")
+
+
+def _audit_categories_with_ai(db: Session, doc: "Document", processor) -> None:
+    """
+    Single AI audit pass: review all assigned categories before the user sees them.
+    Asks AI to flag any wrong assignments and corrects them in-place.
+    Always wrapped in try/except at the call site — never blocks validation.
+    """
+    import json
+    import re
+
+    rows = (
+        db.query(DocumentValidationRow)
+        .filter(
+            DocumentValidationRow.document_id == doc.id,
+            DocumentValidationRow.transaction_type != "transferencia",
+        )
+        .all()
+    )
+    if not rows:
+        return
+
+    items = [
+        {"description": row.description or "", "category": row.category or "nao_categorizado"}
+        for row in rows if (row.description or "").strip()
+    ]
+    if not items:
+        return
+
+    items = items[:200]  # cap to keep prompt manageable
+    items_json = json.dumps(items, ensure_ascii=False)
+
+    CATEGORIES_WITH_NAMES = (
+        "receita_vendas_produtos (Receita de Vendas de Produtos), "
+        "receita_servicos (Receita de Serviços), receita_locacao (Receita de Locação), "
+        "receita_comissoes (Receita de Comissões), receita_contratos_recorrentes (Receita Recorrente), "
+        "impostos_sobre_vendas (Impostos sobre Vendas), devolucoes (Devoluções), "
+        "descontos_concedidos (Descontos Concedidos), cmv (CMV), csp (CSP), "
+        "materia_prima (Matéria-Prima), insumos (Insumos), "
+        "comissoes_sobre_vendas (Comissões s/ Vendas), salarios_producao (Salários Produção), "
+        "encargos_sociais_producao (Encargos Sociais Produção), energia_producao (Energia Produção), "
+        "manutencao_equipamentos_producao (Manutenção Equipamentos), "
+        "salarios_administrativos (Salários Adm), pro_labore (Pró-Labore), "
+        "encargos_sociais_administrativos (Encargos Sociais Adm), aluguel (Aluguel), "
+        "condominio (Condomínio), agua_energia (Água/Energia), "
+        "material_escritorio (Material Escritório), honorarios_contabeis (Honorários Contábeis), "
+        "sistemas_softwares (Sistemas/Softwares), telefonia_internet (Telefonia/Internet), "
+        "marketing_publicidade (Marketing e Publicidade), propaganda_digital (Propaganda Digital), "
+        "comissao_vendas (Comissão de Vendas), fretes (Fretes), "
+        "representantes_comerciais (Representantes Comerciais), "
+        "receita_financeira (Receita Financeira), juros_ativos (Juros Ativos), "
+        "descontos_obtidos (Descontos Obtidos), juros_passivos (Juros Passivos), "
+        "tarifas_bancarias (Tarifas Bancárias / TARIFA BANCARIA / Bank Fees), iof (IOF), "
+        "multas_encargos (Multas e Encargos), irpj (IRPJ), csll (CSLL), "
+        "simples_nacional (Simples Nacional/DAS), iptu (IPTU), taxas_municipais (Taxas Municipais), "
+        "recuperacao_despesas (Recuperação de Despesas), venda_imobilizado (Venda de Imobilizado), "
+        "indenizacoes_recebidas (Indenizações Recebidas), "
+        "outras_receitas_eventuais (Outras Receitas Eventuais), perdas (Perdas), "
+        "indenizacoes_pagas (Indenizações Pagas), doacoes (Doações), "
+        "provisoes (Provisões), depreciacao (Depreciação), amortizacao (Amortização), "
+        "outras_despesas_operacionais (Outras Despesas Operacionais), "
+        "nao_categorizado (Não Categorizado — ONLY as absolute last resort)"
+    )
+
+    prompt = (
+        "You are a Brazilian accounting expert auditing AI-assigned transaction categories.\n"
+        "Review the list below and return ONLY items where the category should be different.\n"
+        "If all look correct, return an empty JSON object {}.\n\n"
+        f"Available categories (key: meaning): {CATEGORIES_WITH_NAMES}\n\n"
+        "Transactions to audit (list of {description, category}):\n"
+        f"{items_json}\n\n"
+        "Return ONLY a valid JSON object mapping description → correct_category_key. "
+        "No markdown, no explanation. Only include entries that need a different category."
+    )
+
+    try:
+        raw = processor.call_text_prompt(prompt, max_tokens=4000, temperature=0.1)
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+        corrections = json.loads(raw)
+    except Exception as e:
+        logger.warning(f"⚠️ AI audit call failed (non-blocking): {e}")
+        return
+
+    VALID_CATEGORIES = {
+        "receita_vendas_produtos", "receita_servicos", "receita_locacao", "receita_comissoes",
+        "receita_contratos_recorrentes", "impostos_sobre_vendas", "devolucoes", "descontos_concedidos",
+        "cmv", "csp", "materia_prima", "insumos", "comissoes_sobre_vendas", "salarios_producao",
+        "encargos_sociais_producao", "energia_producao", "manutencao_equipamentos_producao",
+        "salarios_administrativos", "pro_labore", "encargos_sociais_administrativos", "aluguel",
+        "condominio", "agua_energia", "material_escritorio", "honorarios_contabeis", "sistemas_softwares",
+        "telefonia_internet", "marketing_publicidade", "propaganda_digital", "comissao_vendas", "fretes",
+        "representantes_comerciais", "receita_financeira", "juros_ativos", "descontos_obtidos",
+        "juros_passivos", "tarifas_bancarias", "iof", "multas_encargos", "irpj", "csll",
+        "simples_nacional", "iptu", "taxas_municipais", "recuperacao_despesas", "venda_imobilizado",
+        "indenizacoes_recebidas", "outras_receitas_eventuais", "perdas", "indenizacoes_pagas",
+        "doacoes", "provisoes", "depreciacao", "amortizacao", "outras_despesas_operacionais",
+        "nao_categorizado",
+    }
+
+    # Build desc → rows map for fast lookup
+    desc_to_rows: dict = {}
+    for row in rows:
+        desc = (row.description or "").strip()
+        if desc:
+            desc_to_rows.setdefault(desc, []).append(row)
+
+    updated = 0
+    for desc, new_cat in corrections.items():
+        if new_cat in VALID_CATEGORIES and new_cat != "nao_categorizado":
+            for row in desc_to_rows.get(desc, []):
+                if row.category != new_cat:
+                    row.category = new_cat
+                    updated += 1
+
+    if updated:
+        logger.info(f"✅ AI audit updated {updated} category assignments for doc {doc.id}")
+    else:
+        logger.info(f"✅ AI audit: all categories confirmed for doc {doc.id}")
 
 
 def _create_validation_rows(db: Session, doc: "Document", data_dict: dict):

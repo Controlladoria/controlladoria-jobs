@@ -133,6 +133,7 @@ def _process_document(document_id: int, file_path: str, lambda_context=None):
         _handle_nfe_cancellation,
         _create_validation_rows,
         _batch_categorize_uncategorized_rows,
+        _audit_categories_with_ai,
         _normalize_nf_number,
         find_or_create_client,
     )
@@ -154,11 +155,25 @@ def _process_document(document_id: int, file_path: str, lambda_context=None):
         user = db.query(User).filter(User.id == doc.user_id).first()
         user_company_info = None
         if user:
-            user_company_info = {
-                "company_name": user.company_name or user.full_name,
-                "legal_name": user.full_name,
-                "cnpj": user.cnpj,
-            }
+            # Prefer the org that was active at upload time — it has the correct
+            # name and CNPJ for the document being processed. Falling back to the
+            # user's profile fields would use a different org's data if the user
+            # belongs to multiple organizations.
+            org = None
+            if doc.organization_id:
+                org = db.query(Organization).filter(Organization.id == doc.organization_id).first()
+            if org:
+                user_company_info = {
+                    "company_name": org.trade_name or org.company_name,
+                    "legal_name": org.company_name,
+                    "cnpj": org.cnpj,
+                }
+            else:
+                user_company_info = {
+                    "company_name": user.company_name or user.full_name,
+                    "legal_name": user.full_name,
+                    "cnpj": user.cnpj,
+                }
 
         # Check for resume — if we have progress from a previous run
         progress = {}
@@ -411,6 +426,12 @@ def _process_document(document_id: int, file_path: str, lambda_context=None):
                     _batch_categorize_uncategorized_rows(db, doc, processor)
                 except Exception as e:
                     logger.warning(f"Post-processing categorization failed: {e}")
+
+                # AI audit pass: review all categories before sending to user validation
+                try:
+                    _audit_categories_with_ai(db, doc, processor)
+                except Exception as e:
+                    logger.warning(f"AI audit pass failed (non-blocking): {e}")
 
                 # Audit trail
                 audit_entry = AuditLog(

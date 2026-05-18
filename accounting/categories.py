@@ -743,6 +743,19 @@ DRE_CATEGORIES: Dict[str, dict] = {
         "order": 8.02,
     },
 
+    "amortizacao_divida": {
+        "account_code": "9.1.01",
+        "dre_line": "amortizacao_divida",
+        "line_type": DRELineType.OTHER_EXPENSE,
+        "dre_group": "Não Operacional",
+        "nature": "Despesa",
+        "cost_behavior": None,
+        "section": "9. Não Operacional",
+        "display_name": "Amortização de Dívida",
+        "sign": -1,
+        "order": 9.50,
+    },
+
     # ========================================================================
     # GENERIC / UNCATEGORIZED (catch-all)
     # ========================================================================
