@@ -137,9 +137,9 @@ class Settings(BaseSettings):
 
     # Email (Resend API for password reset, transactional emails)
     resend_api_key: str = ""
-    from_email: str = "ControlladorIA <noreply@controllad oria.com>"
-    admin_email: str = "admin@controllad oria.com"  # Receive contact form notifications
-    support_email: str = "suporte@controllad oria.com"  # Support contact for CNPJ conflicts
+    from_email: str = "ControlladorIA <noreply@controlladoria.com.br>"
+    admin_email: str = "admin@controlladoria.com.br"  # Receive contact form notifications
+    support_email: str = "suporte@controlladoria.com.br"  # Support contact for CNPJ conflicts
     frontend_url: str = "http://localhost:3000"  # For email links
 
     # AWS S3 (File Storage)
@@ -230,8 +230,8 @@ class Settings(BaseSettings):
     trusted_proxy_ips: List[str] = []
 
     # System Admin Configuration
-    sysadmin_subdomain: str = "admin.controllad oria.com.br"  # Separate subdomain for sysadmin
-    sysadmin_frontend_url: str = "https://admin.controllad oria.com.br"  # Production
+    sysadmin_subdomain: str = "admin.controlladoria.com.br"  # Separate subdomain for sysadmin
+    sysadmin_frontend_url: str = "https://admin.controlladoria.com.br"  # Production
     sysadmin_frontend_url_dev: str = "http://localhost:3001"  # Local dev
     sysadmin_allowed_emails: List[str] = []  # Whitelist (empty = allow all flagged sysadmins)
 
